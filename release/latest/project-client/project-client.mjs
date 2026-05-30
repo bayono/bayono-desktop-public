@@ -982,4 +982,4 @@ var ProjectClient = class {
 //#endregion
 export { ProjectClient };
 
-//# sourceMappingURL=project-client.js.map
+//# sourceMappingURL=project-client.mjs.map

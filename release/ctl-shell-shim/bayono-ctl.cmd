@@ -16,7 +16,7 @@ if not defined APPDATA (
 	exit /b 1
 )
 
-set "ENTRYPOINT=%APPDATA%\bayono\latest\ctl-cli\bayono-ctl.js"
+set "ENTRYPOINT=%APPDATA%\bayono\latest\ctl-cli\bayono-ctl.mjs"
 
 if not exist "%ENTRYPOINT%" (
 	echo Error: bayono ctl script not found: %ENTRYPOINT%>&2

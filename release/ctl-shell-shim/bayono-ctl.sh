@@ -67,7 +67,7 @@ fi
 if ! app_data_dir="$(resolve_app_data_dir)"; then
 	exit 1
 fi
-entrypoint="${app_data_dir}/bayono/latest/ctl-cli/bayono-ctl.js"
+entrypoint="${app_data_dir}/bayono/latest/ctl-cli/bayono-ctl.mjs"
 
 if [ ! -f "${entrypoint}" ]; then
 	echo "Error: bayono ctl script not found: ${entrypoint}" >&2
