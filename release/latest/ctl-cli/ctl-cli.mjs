@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 import { createRequire } from "node:module";
 import process$1 from "node:process";
-import fs from "fs";
+import child_process from "child_process";
 import path from "path";
-import os from "node:os";
+import fs from "fs";
+import os from "os";
+import os$1 from "node:os";
 import tty from "node:tty";
-import os$1 from "os";
 import http from "node:http";
 //#region \0rolldown/runtime.js
 var __create = Object.create;
@@ -3046,7 +3047,7 @@ const { program: program$1, createCommand, createArgument, createOption, Command
 const AppConstants = {
 	appName: "bayono",
 	mainServerPort: 14005,
-	projectFilename: "bayono-project.json",
+	projectFilename: "bayono.project.json",
 	standaloneDesktopFolder: "bayono-desktop",
 	standaloneConfigFile: "bayono-desktop.json",
 	directory: {
@@ -3056,23 +3057,96 @@ const AppConstants = {
 		},
 		daemon: {
 			folder: "daemon",
-			startDaemonScript: "bayono-daemon.js"
+			startDaemonScript: "daemon.mjs"
 		},
 		ctlCli: {
 			folder: "ctl-cli",
-			executableName: "bayono-ctl"
+			executableName: "bayono-ctl.mjs"
 		},
-		launcher: {
-			folder: "launcher",
-			executableName: "bayono-launcher.js"
+		installer: {
+			folder: "installer",
+			executableBaseName: "installer"
 		},
 		latest: { folder: "latest" },
 		projectClient: {
 			folder: "project-client",
-			startScript: "bayono-project-client.js"
+			startScript: "project-client.mjs"
 		}
 	}
 };
+const appDataPathUtils = {
+	getDaemonPath: (root) => {
+		return path.join(root, AppConstants.directory.latest.folder, AppConstants.directory.daemon.folder, AppConstants.directory.daemon.startDaemonScript);
+	},
+	getProjectClientPath: (root) => {
+		return path.join(root, AppConstants.directory.latest.folder, AppConstants.directory.projectClient.folder, AppConstants.directory.projectClient.startScript);
+	}
+};
+//#endregion
+//#region src/scripts/lib/std/app-data.ts
+const appDataPaths = {
+	win32: () => process.env.APPDATA ?? "",
+	darwin: () => path.join(os.homedir(), "Library", "Application Support"),
+	linux: () => process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config")
+};
+const AppData = { appName: "bayono" };
+const getBayonoFolderPath = () => {
+	const platform = os.platform();
+	const basePath = appDataPaths[platform]();
+	if (basePath === void 0) return {
+		kind: "err",
+		value: `Unsupported platform: ${platform}`
+	};
+	const bayonoPath = path.join(basePath, AppData.appName);
+	if (!fs.existsSync(bayonoPath)) return {
+		kind: "err",
+		value: `Does not exist: ${bayonoPath}`
+	};
+	if (!fs.statSync(bayonoPath).isDirectory()) return {
+		kind: "err",
+		value: `Not a folder: ${bayonoPath}`
+	};
+	return {
+		kind: "ok",
+		value: bayonoPath
+	};
+};
+//#endregion
+//#region src/scripts/ctl-cli/actions/depot/client-project-actions.ts
+async function ClientProjectForwardAction({ forwardedArgs }) {
+	const appDataFolderPath = await getBayonoFolderPath();
+	if (appDataFolderPath.kind === "err") {
+		console.error(`Failed to determine app data folder path: ${appDataFolderPath.value}`);
+		return;
+	}
+	const execArgs = [appDataPathUtils.getProjectClientPath(appDataFolderPath.value), ...forwardedArgs];
+	const execCmd = ["node", ...execArgs].join(" ");
+	console.log(`Executing: ${execCmd}`);
+	try {
+		const subprocess = child_process.spawn("node", execArgs, { stdio: "inherit" });
+		subprocess.on("error", (error) => {
+			console.error(`Failed to start client project: ${error.message}`);
+		});
+		subprocess.on("exit", (code, signal) => {
+			if (code !== null) if (code === 0) {} else console.error(`Client project process exited with error code ${code}`);
+			else if (signal !== null) console.log(`Client project process was killed with signal ${signal}`);
+			else console.log(`Client project process exited`);
+		});
+	} catch (error) {
+		console.error(`Error starting client project: ${error instanceof Error ? error.message : String(error)}`);
+	}
+}
+//#endregion
+//#region src/scripts/ctl-cli/commands/client-project-commands.ts
+const cmd = "project";
+const clientProjectCommands = new Command(cmd).description("Project client commands").argument("[args...]").helpOption(false).passThroughOptions().allowUnknownOption(true).allowExcessArguments(true).action(async () => {
+	const projectPos = process.argv.findIndex((arg) => arg === cmd);
+	if (projectPos === -1) {
+		console.error(`Error: Could not find command '${cmd}' in arguments`);
+		process.exit(1);
+	}
+	await ClientProjectForwardAction({ forwardedArgs: process.argv.slice(projectPos + 1) });
+});
 //#endregion
 //#region src/scripts/daemon/daemon-config.ts
 const DaemonConfig = {
@@ -3318,7 +3392,7 @@ function _supportsColor(haveStream, { streamIsTTY, sniffFlags = true } = {}) {
 	const min = forceColor || 0;
 	if (env.TERM === "dumb") return min;
 	if (process$1.platform === "win32") {
-		const osRelease = os.release().split(".");
+		const osRelease = os$1.release().split(".");
 		if (Number(osRelease[0]) >= 10 && Number(osRelease[2]) >= 10586) return Number(osRelease[2]) >= 14931 ? 3 : 2;
 		return 1;
 	}
@@ -3517,7 +3591,7 @@ createChalk({ level: stderrColor ? stderrColor.level : 0 });
 //#endregion
 //#region src/scripts/lib/drawing/formatter.ts
 const textFormat = { path: (p) => {
-	const homeDir = os$1.homedir();
+	const homeDir = os.homedir();
 	return p.replace(homeDir, "~");
 } };
 const formatters = {
@@ -3571,35 +3645,6 @@ const CommsMessageUtils = { error: (msg, ...lines) => {
 	formatters.error(Tags.error) + "" + msg + lines.flatMap((line) => indent(2) + line).join("\n");
 	return new CommsMessage();
 } };
-//#endregion
-//#region src/scripts/lib/std/app-data.ts
-const appDataPaths = {
-	win32: () => process.env.APPDATA ?? "",
-	darwin: () => path.join(os$1.homedir(), "Library", "Application Support"),
-	linux: () => process.env.XDG_CONFIG_HOME || path.join(os$1.homedir(), ".config")
-};
-const AppData = { appName: "bayono" };
-const getBayonoFolderPath = () => {
-	const platform = os$1.platform();
-	const basePath = appDataPaths[platform]();
-	if (basePath === void 0) return {
-		kind: "err",
-		value: `Unsupported platform: ${platform}`
-	};
-	const bayonoPath = path.join(basePath, AppData.appName);
-	if (!fs.existsSync(bayonoPath)) return {
-		kind: "err",
-		value: `Does not exist: ${bayonoPath}`
-	};
-	if (!fs.statSync(bayonoPath).isDirectory()) return {
-		kind: "err",
-		value: `Not a folder: ${bayonoPath}`
-	};
-	return {
-		kind: "ok",
-		value: bayonoPath
-	};
-};
 //#endregion
 //#region src/scripts/app-data/daemon-app-data.ts
 var DaemonAppData = class {
@@ -7380,7 +7425,7 @@ const DaemonServerUtils = { make: async () => {
 	return new DaemonServer(appData, logger);
 } };
 //#endregion
-//#region src/scripts/ctl-cli/actions/action/actions.ts
+//#region src/scripts/ctl-cli/actions/depot/daemon-actions.ts
 var DaemonStartAction = class {
 	name = "start";
 	description = "Start the Bayono daemon";
@@ -7435,11 +7480,13 @@ daemonCommands.command("start").description("Start the daemon").action(async (op
 //#endregion
 //#region src/scripts/ctl-cli/ctl-cli.ts
 const program = new Command();
-program.name("Bayono").description("CLI tool for Bayono App ('bayono.com'").version("0.0.1");
+program.name("Bayono").description("CLI tool for Bayono App ('bayono.com')").version("0.0.1");
+program.enablePositionalOptions();
 program.command("status").description("Show status").action(async () => {
 	console.log("Hello from Bayono CLI!");
 });
 program.addCommand(daemonCommands);
+program.addCommand(clientProjectCommands);
 program.parseAsync(process.argv).catch((error) => {
 	console.error(error instanceof Error ? error.message : String(error));
 	process.exit(1);

@@ -3,8 +3,8 @@ import process$1 from "node:process";
 import os from "node:os";
 import tty from "node:tty";
 import os$1 from "os";
-import fs from "fs";
 import path from "path";
+import fs from "fs";
 import http from "node:http";
 //#region \0rolldown/runtime.js
 var __create = Object.create;
@@ -471,7 +471,7 @@ const formatters = {
 const AppConstants = {
 	appName: "bayono",
 	mainServerPort: 14005,
-	projectFilename: "bayono-project.json",
+	projectFilename: "bayono.project.json",
 	standaloneDesktopFolder: "bayono-desktop",
 	standaloneConfigFile: "bayono-desktop.json",
 	directory: {
@@ -481,20 +481,20 @@ const AppConstants = {
 		},
 		daemon: {
 			folder: "daemon",
-			startDaemonScript: "bayono-daemon.js"
+			startDaemonScript: "daemon.mjs"
 		},
 		ctlCli: {
 			folder: "ctl-cli",
-			executableName: "bayono-ctl"
+			executableName: "bayono-ctl.mjs"
 		},
-		launcher: {
-			folder: "launcher",
-			executableName: "bayono-launcher.js"
+		installer: {
+			folder: "installer",
+			executableBaseName: "installer"
 		},
 		latest: { folder: "latest" },
 		projectClient: {
 			folder: "project-client",
-			startScript: "bayono-project-client.js"
+			startScript: "project-client.mjs"
 		}
 	}
 };

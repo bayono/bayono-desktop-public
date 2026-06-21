@@ -9,11 +9,11 @@ This repo contains packaged Bayono binaries and install scripts for macOS, Linux
 - `release/bin/` - platform-specific packaged binary for the CLI
   - See: [CLI](#cli) for more details on the CLI and its contents
 - `release/latest/` - main artifacts that the CLI checks and installs
-  - **main-cli**: Main CLI (also in `release/bin`), a binary application that acts as a thin wrapper to the main ctl-cli, and provides some minor behavior like simple validation, directly calling launcher, and resolving JS runtime.
+  - **main-cli**: Main CLI (also in `release/bin`), a binary application that acts as a thin wrapper to the main ctl-cli, and provides some minor behavior like simple validation, directly calling installer, and resolving JS runtime.
     - See: [CLI](#cli) for more details on the CLI and its contents
   - **ctl-cli**: Real inner CLI application that holds the main logic, but requires a JS runtime
   - **daemon**: Shared server for CLI, apps, extensions, etc.
-  - **launcher**: Installs, updates, repairs installs. Called by CLI for dealing with installation issues (e.g. no installation found)
+  - **installer**: Installs, updates, repairs installs. Called by CLI for dealing with installation issues (e.g. no installation found)
   - **project-client**: Long running process tied to a specific project. Accessed using the CLI tool.
 - `release/get-bayono/` - bootstrap install scripts for [get.bayono.com](https://get.bayono.com)
 
