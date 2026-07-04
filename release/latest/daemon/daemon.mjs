@@ -6,6 +6,10 @@ import os$1 from "os";
 import path from "path";
 import fs from "fs";
 import http from "node:http";
+import { createReadStream } from "node:fs";
+import { stat } from "node:fs/promises";
+import path$1 from "node:path";
+import { randomUUID } from "node:crypto";
 //#region \0rolldown/runtime.js
 var __create = Object.create;
 var __defProp = Object.defineProperty;
@@ -28,7 +32,7 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
 	value: mod,
 	enumerable: true
 }) : target, mod));
-var __require = /* @__PURE__ */ createRequire(import.meta.url);
+var __require = /* #__PURE__ */ (() => createRequire(import.meta.url))();
 //#endregion
 //#region node_modules/chalk/source/vendor/ansi-styles/index.js
 const ANSI_BACKGROUND_OFFSET = 10;
@@ -433,10 +437,20 @@ const chalk = createChalk();
 createChalk({ level: stderrColor ? stderrColor.level : 0 });
 //#endregion
 //#region src/scripts/lib/drawing/formatter.ts
-const textFormat = { path: (p) => {
-	const homeDir = os$1.homedir();
-	return p.replace(homeDir, "~");
-} };
+const textFormat = {
+	path: (p) => {
+		const homeDir = os$1.homedir();
+		return p.replace(homeDir, "~");
+	},
+	pad: (txt, width) => {
+		return txt.length >= width ? txt : txt + " ".repeat(width - txt.length);
+	},
+	maxWidth: (text, maxWidth) => {
+		if (text.length <= maxWidth) return text;
+		if (maxWidth <= 3) return text.slice(0, maxWidth);
+		return text.slice(0, maxWidth - 3) + "...";
+	}
+};
 const formatters = {
 	path: (p) => chalk.underline.blue(textFormat.path(p)),
 	infoLabel: chalk.black.bgCyanBright,
@@ -477,7 +491,8 @@ const AppConstants = {
 	directory: {
 		logs: {
 			folder: "logs",
-			daemon: "daemon.log"
+			daemon: "daemon.log",
+			projectClient: "project-client.log"
 		},
 		daemon: {
 			folder: "daemon",
@@ -504,11 +519,15 @@ const DaemonConfig = {
 	port: AppConstants.mainServerPort,
 	wsPath: "/ws",
 	statusPath: "/status",
+	infoPath: "/info",
+	fileServePath: "/files",
 	logFlushIntervalMs: 2e3
 };
 const DaemonConfigUtils = {
 	getWsUrl: () => `ws://localhost:${DaemonConfig.port}${DaemonConfig.wsPath}`,
-	getStatusUrl: () => `http://localhost:${DaemonConfig.port}${DaemonConfig.statusPath}`
+	getStatusUrl: () => `http://localhost:${DaemonConfig.port}${DaemonConfig.statusPath}`,
+	getInfoUrl: () => `http://localhost:${DaemonConfig.port}${DaemonConfig.infoPath}`,
+	getFileServeUrl: (args) => `http://localhost:${DaemonConfig.port}${DaemonConfig.fileServePath}/${encodeURIComponent(args.id)}/${args.relativePath.split("/").map((part) => encodeURIComponent(part)).join("/")}`
 };
 const BasicCommands = { stopDaemon: "!cmd:stop-daemon" };
 //#endregion
@@ -723,6 +742,2274 @@ const LogFileUtils = { ensureLogFileExists: (logfile, appData) => {
 		return /* @__PURE__ */ new Error(`Failed to ensure log file exists: ${err instanceof Error ? err.message : String(err)}`);
 	}
 } };
+const DEFAULT_CONFIG = {
+	lang: void 0,
+	message: void 0,
+	abortEarly: void 0,
+	abortPipeEarly: void 0
+};
+/**
+* Returns the global configuration.
+*
+* @param config The config to merge.
+*
+* @returns The configuration.
+*/
+/* @__NO_SIDE_EFFECTS__ */
+function getGlobalConfig(config$1) {
+	if (!config$1 && true) return DEFAULT_CONFIG;
+	return {
+		lang: config$1?.lang ?? void 0,
+		message: config$1?.message,
+		abortEarly: config$1?.abortEarly ?? void 0,
+		abortPipeEarly: config$1?.abortPipeEarly ?? void 0
+	};
+}
+/**
+* Stringifies an unknown input to a literal or type string.
+*
+* @param input The unknown input.
+*
+* @returns A literal or type string.
+*
+* @internal
+*/
+/* @__NO_SIDE_EFFECTS__ */
+function _stringify(input) {
+	const type = typeof input;
+	if (type === "string") return `"${input}"`;
+	if (type === "number" || type === "bigint" || type === "boolean") return `${input}`;
+	if (type === "object" || type === "function") return (input && Object.getPrototypeOf(input)?.constructor?.name) ?? "null";
+	return type;
+}
+/**
+* Adds an issue to the dataset.
+*
+* @param context The issue context.
+* @param label The issue label.
+* @param dataset The input dataset.
+* @param config The configuration.
+* @param other The optional props.
+*
+* @internal
+*/
+function _addIssue(context, label, dataset, config$1, other) {
+	const input = other && "input" in other ? other.input : dataset.value;
+	const expected = other?.expected ?? context.expects ?? null;
+	const received = other?.received ?? /* @__PURE__ */ _stringify(input);
+	const issue = {
+		kind: context.kind,
+		type: context.type,
+		input,
+		expected,
+		received,
+		message: `Invalid ${label}: ${expected ? `Expected ${expected} but r` : "R"}eceived ${received}`,
+		requirement: context.requirement,
+		path: other?.path,
+		issues: other?.issues,
+		lang: config$1.lang,
+		abortEarly: config$1.abortEarly,
+		abortPipeEarly: config$1.abortPipeEarly
+	};
+	const isSchema = context.kind === "schema";
+	const message$1 = other?.message ?? context.message ?? (context.reference, issue.lang, void 0) ?? (isSchema ? (issue.lang, void 0) : null) ?? config$1.message ?? (issue.lang, void 0);
+	if (message$1 !== void 0) issue.message = typeof message$1 === "function" ? message$1(issue) : message$1;
+	if (isSchema) dataset.typed = false;
+	if (dataset.issues) dataset.issues.push(issue);
+	else dataset.issues = [issue];
+}
+const _standardCache = /* @__PURE__ */ new WeakMap();
+/**
+* Returns the Standard Schema properties.
+*
+* @param context The schema context.
+*
+* @returns The Standard Schema properties.
+*/
+/* @__NO_SIDE_EFFECTS__ */
+function _getStandardProps(context) {
+	let cached = _standardCache.get(context);
+	if (!cached) {
+		cached = {
+			version: 1,
+			vendor: "valibot",
+			validate(value$1) {
+				return context["~run"]({ value: value$1 }, /* @__PURE__ */ getGlobalConfig());
+			}
+		};
+		_standardCache.set(context, cached);
+	}
+	return cached;
+}
+/**
+* Joins multiple `expects` values with the given separator.
+*
+* @param values The `expects` values.
+* @param separator The separator.
+*
+* @returns The joined `expects` property.
+*
+* @internal
+*/
+/* @__NO_SIDE_EFFECTS__ */
+function _joinExpects(values$1, separator) {
+	const list = [...new Set(values$1)];
+	if (list.length > 1) return `(${list.join(` ${separator} `)})`;
+	return list[0] ?? "never";
+}
+/* @__NO_SIDE_EFFECTS__ */
+function getDotPath(issue) {
+	if (issue.path) {
+		let key = "";
+		for (const item of issue.path) if (typeof item.key === "string" || typeof item.key === "number") if (key) key += `.${item.key}`;
+		else key += item.key;
+		else return null;
+		return key;
+	}
+	return null;
+}
+/**
+* [ISO 8601](https://en.wikipedia.org/wiki/ISO_8601) timestamp regex. Allows a
+* space as a date/time separator and an optional space before the UTC offset.
+*/
+const ISO_TIMESTAMP_REGEX = /^\d{4}-(?:0[1-9]|1[0-2])-(?:[12]\d|0[1-9]|3[01])[T ](?:0\d|1\d|2[0-3])(?::[0-5]\d){2}(?:\.\d{1,9})?(?:Z| ?[+-](?:0\d|1\d|2[0-3])(?::?[0-5]\d)?)$/u;
+/* @__NO_SIDE_EFFECTS__ */
+function isoTimestamp(message$1) {
+	return {
+		kind: "validation",
+		type: "iso_timestamp",
+		reference: isoTimestamp,
+		async: false,
+		expects: null,
+		requirement: ISO_TIMESTAMP_REGEX,
+		message: message$1,
+		"~run"(dataset, config$1) {
+			if (dataset.typed && !this.requirement.test(dataset.value)) _addIssue(this, "timestamp", dataset, config$1);
+			return dataset;
+		}
+	};
+}
+const ABORT_EARLY_CONFIG = { abortEarly: true };
+/**
+* Returns the fallback value of the schema.
+*
+* @param schema The schema to get it from.
+* @param dataset The output dataset if available.
+* @param config The config if available.
+*
+* @returns The fallback value.
+*/
+/* @__NO_SIDE_EFFECTS__ */
+function getFallback(schema, dataset, config$1) {
+	return typeof schema.fallback === "function" ? schema.fallback(dataset, config$1) : schema.fallback;
+}
+/* @__NO_SIDE_EFFECTS__ */
+function flatten(issues) {
+	const flatErrors = {};
+	for (const issue of issues) if (issue.path) {
+		const dotPath = /* @__PURE__ */ getDotPath(issue);
+		if (dotPath) {
+			if (!flatErrors.nested) flatErrors.nested = {};
+			if (flatErrors.nested[dotPath]) flatErrors.nested[dotPath].push(issue.message);
+			else flatErrors.nested[dotPath] = [issue.message];
+		} else if (flatErrors.other) flatErrors.other.push(issue.message);
+		else flatErrors.other = [issue.message];
+	} else if (flatErrors.root) flatErrors.root.push(issue.message);
+	else flatErrors.root = [issue.message];
+	return flatErrors;
+}
+/**
+* Returns the default value of the schema.
+*
+* @param schema The schema to get it from.
+* @param dataset The input dataset if available.
+* @param config The config if available.
+*
+* @returns The default value.
+*/
+/* @__NO_SIDE_EFFECTS__ */
+function getDefault(schema, dataset, config$1) {
+	return typeof schema.default === "function" ? schema.default(dataset, config$1) : schema.default;
+}
+/* @__NO_SIDE_EFFECTS__ */
+function array(item, message$1) {
+	return {
+		kind: "schema",
+		type: "array",
+		reference: array,
+		expects: "Array",
+		async: false,
+		item,
+		message: message$1,
+		get "~standard"() {
+			return /* @__PURE__ */ _getStandardProps(this);
+		},
+		"~run"(dataset, config$1) {
+			const input = dataset.value;
+			if (Array.isArray(input)) {
+				dataset.typed = true;
+				dataset.value = [];
+				for (let key = 0; key < input.length; key++) {
+					const value$1 = input[key];
+					const itemDataset = this.item["~run"]({ value: value$1 }, config$1);
+					if (itemDataset.issues) {
+						const pathItem = {
+							type: "array",
+							origin: "value",
+							input,
+							key,
+							value: value$1
+						};
+						for (const issue of itemDataset.issues) {
+							if (issue.path) issue.path.unshift(pathItem);
+							else issue.path = [pathItem];
+							dataset.issues?.push(issue);
+						}
+						if (!dataset.issues) dataset.issues = itemDataset.issues;
+						if (config$1.abortEarly) {
+							dataset.typed = false;
+							break;
+						}
+					}
+					if (!itemDataset.typed) dataset.typed = false;
+					dataset.value.push(itemDataset.value);
+				}
+			} else _addIssue(this, "type", dataset, config$1);
+			return dataset;
+		}
+	};
+}
+/* @__NO_SIDE_EFFECTS__ */
+function boolean(message$1) {
+	return {
+		kind: "schema",
+		type: "boolean",
+		reference: boolean,
+		expects: "boolean",
+		async: false,
+		message: message$1,
+		get "~standard"() {
+			return /* @__PURE__ */ _getStandardProps(this);
+		},
+		"~run"(dataset, config$1) {
+			if (typeof dataset.value === "boolean") dataset.typed = true;
+			else _addIssue(this, "type", dataset, config$1);
+			return dataset;
+		}
+	};
+}
+/**
+* Merges two values into one single output.
+*
+* @param value1 First value.
+* @param value2 Second value.
+*
+* @returns The merge dataset.
+*
+* @internal
+*/
+/* @__NO_SIDE_EFFECTS__ */
+function _merge(value1, value2) {
+	if (typeof value1 === typeof value2) {
+		if (value1 === value2 || value1 instanceof Date && value2 instanceof Date && +value1 === +value2) return { value: value1 };
+		if (value1 && value2 && value1.constructor === Object && value2.constructor === Object) {
+			const nextValue = { ...value1 };
+			for (const key in value2) if (key in value1) {
+				const dataset = /* @__PURE__ */ _merge(value1[key], value2[key]);
+				if (dataset.issue) return dataset;
+				nextValue[key] = dataset.value;
+			} else nextValue[key] = value2[key];
+			return { value: nextValue };
+		}
+		if (Array.isArray(value1) && Array.isArray(value2)) {
+			if (value1.length === value2.length) {
+				const nextValue = [...value1];
+				for (let index = 0; index < value1.length; index++) {
+					const dataset = /* @__PURE__ */ _merge(value1[index], value2[index]);
+					if (dataset.issue) return dataset;
+					nextValue[index] = dataset.value;
+				}
+				return { value: nextValue };
+			}
+		}
+	}
+	return { issue: true };
+}
+/* @__NO_SIDE_EFFECTS__ */
+function intersect(options, message$1) {
+	return {
+		kind: "schema",
+		type: "intersect",
+		reference: intersect,
+		expects: /* @__PURE__ */ _joinExpects(options.map((option) => option.expects), "&"),
+		async: false,
+		options,
+		message: message$1,
+		get "~standard"() {
+			return /* @__PURE__ */ _getStandardProps(this);
+		},
+		"~run"(dataset, config$1) {
+			if (this.options.length) {
+				const input = dataset.value;
+				let outputs;
+				dataset.typed = true;
+				for (const schema of this.options) {
+					const optionDataset = schema["~run"]({ value: input }, config$1);
+					if (optionDataset.issues) {
+						if (dataset.issues) for (const issue of optionDataset.issues) dataset.issues.push(issue);
+						else dataset.issues = optionDataset.issues;
+						if (config$1.abortEarly) {
+							dataset.typed = false;
+							break;
+						}
+					}
+					if (!optionDataset.typed) dataset.typed = false;
+					if (dataset.typed) if (outputs) outputs.push(optionDataset.value);
+					else outputs = [optionDataset.value];
+				}
+				if (dataset.typed) {
+					dataset.value = outputs[0];
+					for (let index = 1; index < outputs.length; index++) {
+						const mergeDataset = /* @__PURE__ */ _merge(dataset.value, outputs[index]);
+						if (mergeDataset.issue) {
+							_addIssue(this, "type", dataset, config$1, { received: "unknown" });
+							break;
+						}
+						dataset.value = mergeDataset.value;
+					}
+				}
+			} else _addIssue(this, "type", dataset, config$1);
+			return dataset;
+		}
+	};
+}
+/* @__NO_SIDE_EFFECTS__ */
+function literal(literal_, message$1) {
+	return {
+		kind: "schema",
+		type: "literal",
+		reference: literal,
+		expects: /* @__PURE__ */ _stringify(literal_),
+		async: false,
+		literal: literal_,
+		message: message$1,
+		get "~standard"() {
+			return /* @__PURE__ */ _getStandardProps(this);
+		},
+		"~run"(dataset, config$1) {
+			if (dataset.value === this.literal) dataset.typed = true;
+			else _addIssue(this, "type", dataset, config$1);
+			return dataset;
+		}
+	};
+}
+/* @__NO_SIDE_EFFECTS__ */
+function number(message$1) {
+	return {
+		kind: "schema",
+		type: "number",
+		reference: number,
+		expects: "number",
+		async: false,
+		message: message$1,
+		get "~standard"() {
+			return /* @__PURE__ */ _getStandardProps(this);
+		},
+		"~run"(dataset, config$1) {
+			if (typeof dataset.value === "number" && !isNaN(dataset.value)) dataset.typed = true;
+			else _addIssue(this, "type", dataset, config$1);
+			return dataset;
+		}
+	};
+}
+/* @__NO_SIDE_EFFECTS__ */
+function object(entries$1, message$1) {
+	return {
+		kind: "schema",
+		type: "object",
+		reference: object,
+		expects: "Object",
+		async: false,
+		entries: entries$1,
+		message: message$1,
+		get "~standard"() {
+			return /* @__PURE__ */ _getStandardProps(this);
+		},
+		"~run"(dataset, config$1) {
+			const input = dataset.value;
+			if (input && typeof input === "object") {
+				dataset.typed = true;
+				dataset.value = {};
+				for (const key in this.entries) {
+					const valueSchema = this.entries[key];
+					if (key in input || (valueSchema.type === "exact_optional" || valueSchema.type === "optional" || valueSchema.type === "nullish") && valueSchema.default !== void 0) {
+						const value$1 = key in input ? input[key] : /* @__PURE__ */ getDefault(valueSchema);
+						const valueDataset = valueSchema["~run"]({ value: value$1 }, config$1);
+						if (valueDataset.issues) {
+							const pathItem = {
+								type: "object",
+								origin: "value",
+								input,
+								key,
+								value: value$1
+							};
+							for (const issue of valueDataset.issues) {
+								if (issue.path) issue.path.unshift(pathItem);
+								else issue.path = [pathItem];
+								dataset.issues?.push(issue);
+							}
+							if (!dataset.issues) dataset.issues = valueDataset.issues;
+							if (config$1.abortEarly) {
+								dataset.typed = false;
+								break;
+							}
+						}
+						if (!valueDataset.typed) dataset.typed = false;
+						dataset.value[key] = valueDataset.value;
+					} else if (valueSchema.fallback !== void 0) dataset.value[key] = /* @__PURE__ */ getFallback(valueSchema);
+					else if (valueSchema.type !== "exact_optional" && valueSchema.type !== "optional" && valueSchema.type !== "nullish") {
+						_addIssue(this, "key", dataset, config$1, {
+							input: void 0,
+							expected: `"${key}"`,
+							path: [{
+								type: "object",
+								origin: "key",
+								input,
+								key,
+								value: input[key]
+							}]
+						});
+						if (config$1.abortEarly) break;
+					}
+				}
+			} else _addIssue(this, "type", dataset, config$1);
+			return dataset;
+		}
+	};
+}
+/* @__NO_SIDE_EFFECTS__ */
+function optional(wrapped, default_) {
+	return {
+		kind: "schema",
+		type: "optional",
+		reference: optional,
+		expects: `(${wrapped.expects} | undefined)`,
+		async: false,
+		wrapped,
+		default: default_,
+		get "~standard"() {
+			return /* @__PURE__ */ _getStandardProps(this);
+		},
+		"~run"(dataset, config$1) {
+			if (dataset.value === void 0) {
+				if (this.default !== void 0) dataset.value = /* @__PURE__ */ getDefault(this, dataset, config$1);
+				if (dataset.value === void 0) {
+					dataset.typed = true;
+					return dataset;
+				}
+			}
+			return this.wrapped["~run"](dataset, config$1);
+		}
+	};
+}
+/* @__NO_SIDE_EFFECTS__ */
+function picklist(options, message$1) {
+	return {
+		kind: "schema",
+		type: "picklist",
+		reference: picklist,
+		expects: /* @__PURE__ */ _joinExpects(options.map(_stringify), "|"),
+		async: false,
+		options,
+		message: message$1,
+		get "~standard"() {
+			return /* @__PURE__ */ _getStandardProps(this);
+		},
+		"~run"(dataset, config$1) {
+			if (this.options.includes(dataset.value)) dataset.typed = true;
+			else _addIssue(this, "type", dataset, config$1);
+			return dataset;
+		}
+	};
+}
+/* @__NO_SIDE_EFFECTS__ */
+function string(message$1) {
+	return {
+		kind: "schema",
+		type: "string",
+		reference: string,
+		expects: "string",
+		async: false,
+		message: message$1,
+		get "~standard"() {
+			return /* @__PURE__ */ _getStandardProps(this);
+		},
+		"~run"(dataset, config$1) {
+			if (typeof dataset.value === "string") dataset.typed = true;
+			else _addIssue(this, "type", dataset, config$1);
+			return dataset;
+		}
+	};
+}
+/**
+* Returns the sub issues of the provided datasets for the union issue.
+*
+* @param datasets The datasets.
+*
+* @returns The sub issues.
+*
+* @internal
+*/
+/* @__NO_SIDE_EFFECTS__ */
+function _subIssues(datasets) {
+	let issues;
+	if (datasets) for (const dataset of datasets) if (issues) for (const issue of dataset.issues) issues.push(issue);
+	else issues = dataset.issues;
+	return issues;
+}
+/* @__NO_SIDE_EFFECTS__ */
+function union(options, message$1) {
+	return {
+		kind: "schema",
+		type: "union",
+		reference: union,
+		expects: /* @__PURE__ */ _joinExpects(options.map((option) => option.expects), "|"),
+		async: false,
+		options,
+		message: message$1,
+		get "~standard"() {
+			return /* @__PURE__ */ _getStandardProps(this);
+		},
+		"~run"(dataset, config$1) {
+			let validDataset;
+			let typedDatasets;
+			let untypedDatasets;
+			for (const schema of this.options) {
+				const optionDataset = schema["~run"]({ value: dataset.value }, config$1);
+				if (optionDataset.typed) if (optionDataset.issues) if (typedDatasets) typedDatasets.push(optionDataset);
+				else typedDatasets = [optionDataset];
+				else {
+					validDataset = optionDataset;
+					break;
+				}
+				else if (untypedDatasets) untypedDatasets.push(optionDataset);
+				else untypedDatasets = [optionDataset];
+			}
+			if (validDataset) return validDataset;
+			if (typedDatasets) {
+				if (typedDatasets.length === 1) return typedDatasets[0];
+				_addIssue(this, "type", dataset, config$1, { issues: /* @__PURE__ */ _subIssues(typedDatasets) });
+				dataset.typed = true;
+			} else if (untypedDatasets?.length === 1) return untypedDatasets[0];
+			else _addIssue(this, "type", dataset, config$1, { issues: /* @__PURE__ */ _subIssues(untypedDatasets) });
+			return dataset;
+		}
+	};
+}
+/**
+* Creates a unknown schema.
+*
+* @returns A unknown schema.
+*/
+/* @__NO_SIDE_EFFECTS__ */
+function unknown() {
+	return {
+		kind: "schema",
+		type: "unknown",
+		reference: unknown,
+		expects: "unknown",
+		async: false,
+		get "~standard"() {
+			return /* @__PURE__ */ _getStandardProps(this);
+		},
+		"~run"(dataset) {
+			dataset.typed = true;
+			return dataset;
+		}
+	};
+}
+/* @__NO_SIDE_EFFECTS__ */
+function variant(key, options, message$1) {
+	return {
+		kind: "schema",
+		type: "variant",
+		reference: variant,
+		expects: "Object",
+		async: false,
+		key,
+		options,
+		message: message$1,
+		get "~standard"() {
+			return /* @__PURE__ */ _getStandardProps(this);
+		},
+		"~run"(dataset, config$1) {
+			const input = dataset.value;
+			if (input && typeof input === "object") {
+				let outputDataset;
+				let maxDiscriminatorPriority = 0;
+				let invalidDiscriminatorKey = this.key;
+				let expectedDiscriminators = [];
+				const parseOptions = (variant$1, allKeys) => {
+					for (const schema of variant$1.options) {
+						if (schema.type === "variant") parseOptions(schema, new Set(allKeys).add(schema.key));
+						else {
+							let keysAreValid = true;
+							let currentPriority = 0;
+							for (const currentKey of allKeys) {
+								const discriminatorSchema = schema.entries[currentKey];
+								if (currentKey in input ? discriminatorSchema["~run"]({
+									typed: false,
+									value: input[currentKey]
+								}, ABORT_EARLY_CONFIG).issues : discriminatorSchema.type !== "exact_optional" && discriminatorSchema.type !== "optional" && discriminatorSchema.type !== "nullish") {
+									keysAreValid = false;
+									if (invalidDiscriminatorKey !== currentKey && (maxDiscriminatorPriority < currentPriority || maxDiscriminatorPriority === currentPriority && currentKey in input && !(invalidDiscriminatorKey in input))) {
+										maxDiscriminatorPriority = currentPriority;
+										invalidDiscriminatorKey = currentKey;
+										expectedDiscriminators = [];
+									}
+									if (invalidDiscriminatorKey === currentKey) expectedDiscriminators.push(schema.entries[currentKey].expects);
+									break;
+								}
+								currentPriority++;
+							}
+							if (keysAreValid) {
+								const optionDataset = schema["~run"]({ value: input }, config$1);
+								if (!outputDataset || !outputDataset.typed && optionDataset.typed) outputDataset = optionDataset;
+							}
+						}
+						if (outputDataset && !outputDataset.issues) break;
+					}
+				};
+				parseOptions(this, /* @__PURE__ */ new Set([this.key]));
+				if (outputDataset) return outputDataset;
+				_addIssue(this, "type", dataset, config$1, {
+					input: input[invalidDiscriminatorKey],
+					expected: /* @__PURE__ */ _joinExpects(expectedDiscriminators, "|"),
+					path: [{
+						type: "object",
+						origin: "value",
+						input,
+						key: invalidDiscriminatorKey,
+						value: input[invalidDiscriminatorKey]
+					}]
+				});
+			} else _addIssue(this, "type", dataset, config$1);
+			return dataset;
+		}
+	};
+}
+/* @__NO_SIDE_EFFECTS__ */
+function pipe(...pipe$1) {
+	return {
+		...pipe$1[0],
+		pipe: pipe$1,
+		get "~standard"() {
+			return /* @__PURE__ */ _getStandardProps(this);
+		},
+		"~run"(dataset, config$1) {
+			for (const item of pipe$1) if (item.kind !== "metadata") {
+				if (dataset.issues && (item.kind === "schema" || item.kind === "transformation")) {
+					dataset.typed = false;
+					break;
+				}
+				if (!dataset.issues || !config$1.abortEarly && !config$1.abortPipeEarly) dataset = item["~run"](dataset, config$1);
+			}
+			return dataset;
+		}
+	};
+}
+/**
+* Parses an unknown input based on a schema.
+*
+* @param schema The schema to be used.
+* @param input The input to be parsed.
+* @param config The parse configuration.
+*
+* @returns The parse result.
+*/
+/* @__NO_SIDE_EFFECTS__ */
+function safeParse(schema, input, config$1) {
+	const dataset = schema["~run"]({ value: input }, /* @__PURE__ */ getGlobalConfig(config$1));
+	return {
+		typed: dataset.typed,
+		success: !dataset.issues,
+		output: dataset.value,
+		issues: dataset.issues
+	};
+}
+const MessageKindValues = Object.values({
+	register: "register",
+	callMe: "callMe",
+	pingPong: "pingPong",
+	event: "event"
+});
+let HubBasisSchema;
+(function(_HubBasisSchema) {
+	_HubBasisSchema.HubProtocolVersionSchema = /* @__PURE__ */ literal(1);
+	const MessageKindSchema = _HubBasisSchema.MessageKindSchema = /* @__PURE__ */ picklist(MessageKindValues);
+	_HubBasisSchema.BaseHubMessageSchema = /* @__PURE__ */ object({
+		messageId: /* @__PURE__ */ string(),
+		kind: MessageKindSchema,
+		sentAt: /* @__PURE__ */ optional(/* @__PURE__ */ number())
+	});
+})(HubBasisSchema || (HubBasisSchema = {}));
+//#endregion
+//#region src/scripts/a-share/inter-app-net/hub-client-protocol/host.ts
+const HostKinds = {
+	hub: "hub",
+	webApp: "web-app",
+	projectClient: "project-client",
+	client: "client"
+};
+let HostSchema;
+(function(_HostSchema) {
+	const HubHostSchema = _HostSchema.HubHostSchema = /* @__PURE__ */ object({
+		kind: /* @__PURE__ */ literal(HostKinds.hub),
+		id: /* @__PURE__ */ string()
+	});
+	const WebAppHostSchema = _HostSchema.WebAppHostSchema = /* @__PURE__ */ object({
+		kind: /* @__PURE__ */ literal(HostKinds.webApp),
+		id: /* @__PURE__ */ string()
+	});
+	const ProjectClientHostSchema = _HostSchema.ProjectClientHostSchema = /* @__PURE__ */ object({
+		kind: /* @__PURE__ */ literal(HostKinds.projectClient),
+		id: /* @__PURE__ */ string(),
+		name: /* @__PURE__ */ string(),
+		path: /* @__PURE__ */ string(),
+		projectId: /* @__PURE__ */ optional(/* @__PURE__ */ string())
+	});
+	const GenericClientHostSchema = _HostSchema.GenericClientHostSchema = /* @__PURE__ */ object({
+		kind: /* @__PURE__ */ literal(HostKinds.client),
+		id: /* @__PURE__ */ string(),
+		label: /* @__PURE__ */ optional(/* @__PURE__ */ string())
+	});
+	_HostSchema.ClientHostSchema = /* @__PURE__ */ variant("kind", [
+		WebAppHostSchema,
+		ProjectClientHostSchema,
+		GenericClientHostSchema
+	]);
+	_HostSchema.NetworkHostSchema = /* @__PURE__ */ variant("kind", [
+		HubHostSchema,
+		WebAppHostSchema,
+		ProjectClientHostSchema,
+		GenericClientHostSchema
+	]);
+})(HostSchema || (HostSchema = {}));
+//#endregion
+//#region src/scripts/a-share/inter-app-net/hub-client-protocol/call-me.ts
+const CallMeActions = {
+	init: "init",
+	ack: "ack"
+};
+let CallMeSchema;
+(function(_CallMeSchema) {
+	const CallMeActionSchema = _CallMeSchema.CallMeActionSchema = /* @__PURE__ */ picklist([CallMeActions.init, CallMeActions.ack]);
+	const CallMeBaseMessageSchema = _CallMeSchema.CallMeBaseMessageSchema = /* @__PURE__ */ intersect([HubBasisSchema.BaseHubMessageSchema, /* @__PURE__ */ object({
+		kind: /* @__PURE__ */ literal("callMe"),
+		action: CallMeActionSchema,
+		summonId: /* @__PURE__ */ string()
+	})]);
+	_CallMeSchema.CallMeMessageSchema = /* @__PURE__ */ union([_CallMeSchema.CallMeInitMessageSchema = /* @__PURE__ */ intersect([CallMeBaseMessageSchema, /* @__PURE__ */ object({
+		action: /* @__PURE__ */ literal("init"),
+		summonKey: /* @__PURE__ */ string(),
+		from: /* @__PURE__ */ optional(HostSchema.ClientHostSchema),
+		payload: /* @__PURE__ */ optional(/* @__PURE__ */ unknown())
+	})]), _CallMeSchema.CallMeAckMessageSchema = /* @__PURE__ */ intersect([CallMeBaseMessageSchema, /* @__PURE__ */ object({
+		action: /* @__PURE__ */ literal("ack"),
+		payload: /* @__PURE__ */ optional(/* @__PURE__ */ unknown())
+	})])]);
+})(CallMeSchema || (CallMeSchema = {}));
+//#endregion
+//#region src/scripts/a-share/inter-app-net/hub-client-protocol/hub-event.ts
+const HubEventScopes = {
+	system: "system",
+	hub: "hub",
+	client: "client"
+};
+let HubEventSchema;
+(function(_HubEventSchema) {
+	const HubEventScopeSchema = _HubEventSchema.HubEventScopeSchema = /* @__PURE__ */ picklist([
+		HubEventScopes.system,
+		HubEventScopes.hub,
+		HubEventScopes.client
+	]);
+	_HubEventSchema.HubEventMessageSchema = /* @__PURE__ */ intersect([HubBasisSchema.BaseHubMessageSchema, /* @__PURE__ */ object({
+		kind: /* @__PURE__ */ literal("event"),
+		scope: HubEventScopeSchema,
+		eventKey: /* @__PURE__ */ string(),
+		payload: /* @__PURE__ */ optional(/* @__PURE__ */ unknown())
+	})]);
+})(HubEventSchema || (HubEventSchema = {}));
+//#endregion
+//#region src/scripts/a-share/inter-app-net/hub-client-protocol/register.ts
+const RegisterActions = {
+	request: "registerRequest",
+	response: "registerResponse"
+};
+let RegisterSchema;
+(function(_RegisterSchema) {
+	const RegisterActionSchema = _RegisterSchema.RegisterActionSchema = /* @__PURE__ */ picklist([RegisterActions.request, RegisterActions.response]);
+	const RegisterBaseMessageSchema = _RegisterSchema.RegisterBaseMessageSchema = /* @__PURE__ */ intersect([HubBasisSchema.BaseHubMessageSchema, /* @__PURE__ */ object({
+		kind: /* @__PURE__ */ literal("register"),
+		action: RegisterActionSchema
+	})]);
+	const RegisterRequestMessageSchema = _RegisterSchema.RegisterRequestMessageSchema = /* @__PURE__ */ intersect([RegisterBaseMessageSchema, /* @__PURE__ */ object({
+		action: /* @__PURE__ */ literal("registerRequest"),
+		from: HostSchema.ClientHostSchema
+	})]);
+	const RegisterResponseErrorTypeSchema = _RegisterSchema.RegisterResponseErrorTypeSchema = /* @__PURE__ */ picklist([
+		"already-registered",
+		"invalid-client-host",
+		"hub-not-found",
+		"other"
+	]);
+	const RegistrationSchema = _RegisterSchema.RegistrationSchema = /* @__PURE__ */ object({
+		clientHost: HostSchema.ClientHostSchema,
+		hubId: HostSchema.HubHostSchema.entries.id,
+		hostToken: /* @__PURE__ */ string()
+	});
+	const RegisterResultSchema = _RegisterSchema.RegisterResultSchema = /* @__PURE__ */ variant("kind", [/* @__PURE__ */ object({
+		kind: /* @__PURE__ */ literal("ok"),
+		registration: RegistrationSchema
+	}), /* @__PURE__ */ object({
+		kind: /* @__PURE__ */ literal("error"),
+		error: RegisterResponseErrorTypeSchema,
+		details: /* @__PURE__ */ optional(/* @__PURE__ */ string()),
+		data: /* @__PURE__ */ optional(/* @__PURE__ */ object({}))
+	})]);
+	_RegisterSchema.RegisterMessageSchema = /* @__PURE__ */ union([RegisterRequestMessageSchema, _RegisterSchema.RegisterResponseMessageSchema = /* @__PURE__ */ intersect([RegisterBaseMessageSchema, /* @__PURE__ */ object({
+		action: /* @__PURE__ */ literal("registerResponse"),
+		result: RegisterResultSchema
+	})])]);
+})(RegisterSchema || (RegisterSchema = {}));
+//#endregion
+//#region src/scripts/a-share/inter-app-net/hub-client-protocol/ping-pong.ts
+const PingPongActions = {
+	ping: "ping",
+	pong: "pong"
+};
+let PingPongSchema;
+(function(_PingPongSchema) {
+	const PingPongActionSchema = _PingPongSchema.PingPongActionSchema = /* @__PURE__ */ picklist([PingPongActions.ping, PingPongActions.pong]);
+	const PingPongBaseMessageSchema = _PingPongSchema.PingPongBaseMessageSchema = /* @__PURE__ */ intersect([HubBasisSchema.BaseHubMessageSchema, /* @__PURE__ */ object({
+		kind: /* @__PURE__ */ literal("pingPong"),
+		action: PingPongActionSchema,
+		nonce: /* @__PURE__ */ optional(/* @__PURE__ */ string())
+	})]);
+	_PingPongSchema.PingPongMessageSchema = /* @__PURE__ */ union([_PingPongSchema.PingMessageSchema = /* @__PURE__ */ intersect([PingPongBaseMessageSchema, /* @__PURE__ */ object({ action: /* @__PURE__ */ literal("ping") })]), _PingPongSchema.PongMessageSchema = /* @__PURE__ */ intersect([PingPongBaseMessageSchema, /* @__PURE__ */ object({
+		action: /* @__PURE__ */ literal("pong"),
+		replyToMessageId: /* @__PURE__ */ string()
+	})])]);
+})(PingPongSchema || (PingPongSchema = {}));
+//#endregion
+//#region src/scripts/daemon/hub/summons-tracker.ts
+var SummonsPromise = class {
+	resolve = () => {};
+	reject = () => {};
+	promise;
+	timeoutMs;
+	constructor(timeoutMs = 1e4) {
+		this.timeoutMs = timeoutMs;
+		this.promise = new Promise((resolve, reject) => {
+			const timeoutId = setTimeout(() => {
+				reject(/* @__PURE__ */ new Error(`Summons promise timed out after ${timeoutMs}ms`));
+			}, timeoutMs);
+			this.resolve = (value) => {
+				clearTimeout(timeoutId);
+				resolve(value);
+			};
+			this.reject = (reason) => {
+				clearTimeout(timeoutId);
+				reject(reason);
+			};
+		});
+	}
+};
+var SummonsTracker = class {
+	registry = /* @__PURE__ */ new Map();
+};
+//#endregion
+//#region src/scripts/daemon/hub/hub.ts
+var Client = class {
+	ws;
+	serverCxnUuid = crypto.randomUUID();
+	host = null;
+	secretToken = null;
+	get clientId() {
+		return this.host?.id ?? null;
+	}
+	constructor(ws) {
+		this.ws = ws;
+	}
+};
+var ClientManager = class {
+	logger;
+	clients = /* @__PURE__ */ new Set();
+	clientsByHostId = /* @__PURE__ */ new Map();
+	clientsBySecretToken = /* @__PURE__ */ new Map();
+	registeredClients = /* @__PURE__ */ new Set();
+	constructor(logger) {
+		this.logger = logger;
+	}
+	addClient(client) {
+		this.clients.add(client);
+		this.logger.log(`Client added. Total clients: ${this.clients.size}`);
+	}
+	removeClient(client) {
+		if (!this.clients.delete(client)) {
+			this.logger.log("Attempted to remove a client that was not found.");
+			return;
+		}
+		if (this.registeredClients.has(client)) this.registeredClients.delete(client);
+		if (client.secretToken) {
+			const owner = this.clientsBySecretToken.get(client.secretToken);
+			if (owner === client) this.clientsBySecretToken.delete(client.secretToken);
+			else this.logger.log(`Error: client secret token mismatch during removal. Expected: ${client.secretToken}, found: ${owner?.secretToken}`);
+		}
+		if (client.clientId) {
+			if (this.clientsByHostId.get(client.clientId) === client) this.clientsByHostId.delete(client.clientId);
+		}
+		this.logger.log(`Client removed. Total clients: ${this.clients.size}`);
+	}
+	bindHost(client, host, token) {
+		const existingClient = this.clientsByHostId.get(host.id);
+		if (existingClient && existingClient !== client) return {
+			ok: false,
+			reason: `ALREADY_EXISTS`
+		};
+		if (client.clientId && client.clientId !== host.id) this.clientsByHostId.delete(client.clientId);
+		client.host = host;
+		client.secretToken = token;
+		this.clientsByHostId.set(host.id, client);
+		this.clientsBySecretToken.set(token, client);
+		this.logger.log(`Client bound to id: ${host.id}`);
+		return { ok: true };
+	}
+	getByHostId(hostId) {
+		return this.clientsByHostId.get(hostId) ?? null;
+	}
+	getBySecretToken(token) {
+		return this.clientsBySecretToken.get(token) ?? null;
+	}
+};
+var DaemonHub = class {
+	logger;
+	websocketServer = null;
+	clients;
+	summonsTracker = new SummonsTracker();
+	hubId = crypto.randomUUID();
+	constructor(logger) {
+		this.logger = logger;
+		this.clients = new ClientManager(logger);
+	}
+	handleConnection(ws) {
+		this.logger.log("Handling new WebSocket connection.");
+		const client = new Client(ws);
+		this.clients.addClient(client);
+		ws.on("message", (message) => {
+			this.handleMessage(client, message.toString());
+		});
+		ws.on("close", () => {
+			this.logger.log("WebSocket connection closed.");
+			this.clients.removeClient(client);
+		});
+	}
+	handleMessage(client, message) {
+		if (message.startsWith("!cmd:")) return;
+		this.logger.log(`Received message: ${message}`);
+		let messageData;
+		try {
+			messageData = JSON.parse(message);
+		} catch {
+			this.logger.log("Rejected non-JSON websocket payload.");
+			return;
+		}
+		const parsed = /* @__PURE__ */ safeParse(/* @__PURE__ */ object({ kind: /* @__PURE__ */ string() }), messageData);
+		if (!parsed.success) {
+			this.logger.log("Rejected message with invalid format.");
+			return;
+		}
+		const messageKind = parsed.output.kind;
+		switch (messageKind) {
+			case "pingPong":
+				const pingPongParsed = /* @__PURE__ */ safeParse(PingPongSchema.PingPongMessageSchema, messageData);
+				if (!pingPongParsed.success) {
+					this.logger.log("Rejected pingPong message with invalid format.");
+					return;
+				}
+				this.handlePingPong(client, pingPongParsed.output);
+				return;
+			case "register":
+				const registerParsed = /* @__PURE__ */ safeParse(RegisterSchema.RegisterRequestMessageSchema, messageData);
+				if (!registerParsed.success) {
+					this.logger.log("Rejected register message with invalid format.");
+					return;
+				}
+				this.handleRegister(client, registerParsed.output);
+				return;
+			case "callMe":
+				const callMeParsed = /* @__PURE__ */ safeParse(CallMeSchema.CallMeMessageSchema, messageData);
+				if (!callMeParsed.success) {
+					this.logger.log("Error: invalid 'callMe' format");
+					return;
+				}
+				const action = callMeParsed.output.action;
+				this.logger.log(`CallMe ${action} message received.`);
+				if (action === "init") this.logger.log(`Error: daemon received 'init`);
+				return;
+		}
+		this.logger.log(`Rejected unsupported message payload. Kind: ${messageKind}`);
+	}
+	handlePingPong(client, message) {
+		if (message.action === "pong") {
+			this.logger.log(`client[${client.clientId}]: pong`);
+			return;
+		}
+		const pongMessage = createPongMessage(message);
+		this.send(client, pongMessage);
+	}
+	handleRegister(client, message) {
+		if (message.action !== "registerRequest") {
+			this.logger.log("Rejected unexpected register response sent to hub.");
+			return;
+		}
+		const secretToken = crypto.randomUUID();
+		const bound = this.clients.bindHost(client, message.from, secretToken);
+		if (!bound.ok) {
+			if (bound.reason === "ALREADY_EXISTS") {
+				this.logger.log(`Reg. failed: Host "${message.from.id}" is already registered`);
+				this.send(client, registerAlreadyExistsErrorResponse());
+				return;
+			}
+			this.send(client, registerErrorResponse("other"));
+			return;
+		}
+		this.send(client, createRegisterSuccessResponse(message.from, this.hubId, secretToken));
+	}
+	send(client, message) {
+		try {
+			client.ws.send(JSON.stringify(message));
+		} catch (err) {
+			this.logger.log(`Failed to send websocket message: ${err}`);
+		}
+	}
+};
+function createPongMessage(pingMessage) {
+	return {
+		kind: "pingPong",
+		action: "pong",
+		messageId: crypto.randomUUID(),
+		replyToMessageId: pingMessage.messageId,
+		sentAt: Date.now()
+	};
+}
+function registerAlreadyExistsErrorResponse() {
+	return {
+		kind: "register",
+		action: "registerResponse",
+		result: {
+			kind: "error",
+			error: "already-registered",
+			details: "Host is already registered to another client."
+		},
+		messageId: crypto.randomUUID(),
+		sentAt: Date.now()
+	};
+}
+function registerErrorResponse(err, details, data) {
+	return {
+		kind: "register",
+		action: "registerResponse",
+		result: {
+			kind: "error",
+			error: err,
+			details,
+			data
+		},
+		messageId: crypto.randomUUID(),
+		sentAt: Date.now()
+	};
+}
+function createRegisterSuccessResponse(clientHost, hubId, secretToken) {
+	return {
+		kind: "register",
+		action: "registerResponse",
+		result: {
+			kind: "ok",
+			registration: {
+				clientHost,
+				hubId,
+				hostToken: secretToken
+			}
+		},
+		messageId: crypto.randomUUID(),
+		sentAt: Date.now()
+	};
+}
+//#endregion
+//#region src/scripts/a-share/inter-app-net/hub-api/client.ts
+let ClientSchema;
+(function(_ClientSchema) {
+	_ClientSchema.ClientListRequestBodySchema = /* @__PURE__ */ object({});
+	_ClientSchema.ClientListResponseBodySchema = /* @__PURE__ */ object({ clients: /* @__PURE__ */ array(/* @__PURE__ */ object({
+		clientId: /* @__PURE__ */ string(),
+		host: HostSchema.ClientHostSchema
+	})) });
+	_ClientSchema.ClientSummaryRequestBodySchema = /* @__PURE__ */ object({});
+	_ClientSchema.ClientSummaryResponseBodySchema = /* @__PURE__ */ object({
+		totalClients: /* @__PURE__ */ number(),
+		registeredClients: /* @__PURE__ */ number(),
+		totalWebApps: /* @__PURE__ */ number(),
+		totalProjectClients: /* @__PURE__ */ number()
+	});
+})(ClientSchema || (ClientSchema = {}));
+//#endregion
+//#region src/scripts/a-share/inter-app-net/hub-api/info.ts
+let InfoSchema;
+(function(_InfoSchema) {
+	_InfoSchema.InfoRequestBodySchema = /* @__PURE__ */ object({});
+	_InfoSchema.InfoResponseBodySchema = /* @__PURE__ */ object({
+		service: /* @__PURE__ */ literal("bayono/hub"),
+		status: /* @__PURE__ */ literal("ok"),
+		timestamp: /* @__PURE__ */ pipe(/* @__PURE__ */ string(), /* @__PURE__ */ isoTimestamp()),
+		uptime: /* @__PURE__ */ number(),
+		version: /* @__PURE__ */ string(),
+		appData: /* @__PURE__ */ object({
+			rootDir: /* @__PURE__ */ string(),
+			rootKind: /* @__PURE__ */ picklist(["project", "global"])
+		})
+	});
+})(InfoSchema || (InfoSchema = {}));
+//#endregion
+//#region src/scripts/a-share/inter-app-net/hub-api/project-client-api.ts
+const ProjectClientSummons = {
+	info: "info",
+	pairTrigger: "pairTrigger",
+	pairComplete: "pairComplete",
+	pairDisconnect: "pairDisconnect",
+	message: "message",
+	askLLm: "askLLm"
+};
+let ProjectClientApiSchema;
+(function(_ProjectClientApiSchema) {
+	_ProjectClientApiSchema.ProjectClientInfoRequestBodySchema = /* @__PURE__ */ object({});
+	_ProjectClientApiSchema.ProjectClientInfoResponseBodySchema = /* @__PURE__ */ object({
+		version: /* @__PURE__ */ string(),
+		timestamp: /* @__PURE__ */ pipe(/* @__PURE__ */ string(), /* @__PURE__ */ isoTimestamp()),
+		uptime: /* @__PURE__ */ number(),
+		folderPath: /* @__PURE__ */ string(),
+		projectConfig: /* @__PURE__ */ object({ projectName: /* @__PURE__ */ string() }),
+		projectFile: /* @__PURE__ */ optional(/* @__PURE__ */ object({
+			name: /* @__PURE__ */ string(),
+			description: /* @__PURE__ */ string(),
+			projectUuid: /* @__PURE__ */ optional(/* @__PURE__ */ string())
+		}))
+	});
+	_ProjectClientApiSchema.ProjectClientPairTriggerRequestBodySchema = /* @__PURE__ */ object({
+		triggerId: /* @__PURE__ */ string(),
+		webAppHost: HostSchema.WebAppHostSchema
+	});
+	_ProjectClientApiSchema.ProjectClientPairTriggerResponseBodySchema = /* @__PURE__ */ object({
+		success: /* @__PURE__ */ boolean(),
+		message: /* @__PURE__ */ optional(/* @__PURE__ */ string())
+	});
+	_ProjectClientApiSchema.ProjectClientPairCompleteRequestBodySchema = /* @__PURE__ */ object({
+		webAppHost: HostSchema.WebAppHostSchema,
+		pairRequestId: /* @__PURE__ */ string()
+	});
+	_ProjectClientApiSchema.ProjectClientPairCompleteResponseBodySchema = /* @__PURE__ */ object({
+		success: /* @__PURE__ */ boolean(),
+		pairSessionId: /* @__PURE__ */ string(),
+		projectClientHost: HostSchema.ProjectClientHostSchema,
+		message: /* @__PURE__ */ optional(/* @__PURE__ */ string())
+	});
+	_ProjectClientApiSchema.ProjectClientPairDisconnectRequestBodySchema = /* @__PURE__ */ object({ pairSessionId: /* @__PURE__ */ string() });
+	_ProjectClientApiSchema.ProjectClientPairDisconnectResponseBodySchema = /* @__PURE__ */ object({
+		success: /* @__PURE__ */ boolean(),
+		message: /* @__PURE__ */ optional(/* @__PURE__ */ string())
+	});
+	_ProjectClientApiSchema.ProjectClientMessageRequestBodySchema = /* @__PURE__ */ object({ text: /* @__PURE__ */ string() });
+	_ProjectClientApiSchema.ProjectClientMessageResponseBodySchema = /* @__PURE__ */ object({
+		success: /* @__PURE__ */ boolean(),
+		message: /* @__PURE__ */ optional(/* @__PURE__ */ string())
+	});
+	_ProjectClientApiSchema.ProjectClientAskLLmRequestBodySchema = /* @__PURE__ */ object({ text: /* @__PURE__ */ string() });
+	_ProjectClientApiSchema.ProjectClientAskLLmResponseBodySchema = /* @__PURE__ */ object({
+		success: /* @__PURE__ */ boolean(),
+		message: /* @__PURE__ */ optional(/* @__PURE__ */ string())
+	});
+})(ProjectClientApiSchema || (ProjectClientApiSchema = {}));
+//#endregion
+//#region src/scripts/a-share/inter-app-net/hub-api/routes.ts
+const Routes = {
+	status: "/status",
+	info: "/info",
+	api: {
+		client: {
+			pathPrefix: "/api/client",
+			list: "/api/client/list"
+		},
+		webApp: {
+			pathPrefix: "/api/web-app",
+			pairStart: {
+				action: "pair-start",
+				path: (id) => `/api/web-app/id/${id}/pair-start`
+			},
+			pairDisconnect: {
+				action: "pair-disconnect",
+				path: (id) => `/api/web-app/id/${id}/pair-disconnect`
+			}
+		},
+		projectClient: {
+			pathPrefix: "/api/project-client",
+			info: {
+				action: "info",
+				path: (id) => `/api/project-client/id/${id}/info`
+			},
+			download: {
+				action: "download",
+				path: (id) => `/api/project-client/id/${id}/download`
+			},
+			pairTrigger: {
+				action: "pair-trigger",
+				path: (id) => `/api/project-client/id/${id}/pair-trigger`
+			},
+			pairComplete: {
+				action: "pair-complete",
+				path: (id) => `/api/project-client/id/${id}/pair-complete`
+			},
+			pairDisconnect: {
+				action: "pair-disconnect",
+				path: (id) => `/api/project-client/id/${id}/pair-disconnect`
+			},
+			message: {
+				action: "message",
+				path: (id) => `/api/project-client/id/${id}/message`
+			},
+			askLLm: {
+				action: "ask-llm",
+				path: (id) => `/api/project-client/id/${id}/ask-llm`
+			}
+		},
+		summons: {
+			pathPrefix: "/api/summons",
+			answer: "/api/summons/answer"
+		}
+	}
+};
+`${Routes.status}`, `${Routes.info}`, `${Routes.api.client.list}`, `${Routes.api.summons.answer}`;
+//#endregion
+//#region src/scripts/a-share/inter-app-net/hub-api/status.ts
+let StatusSchema;
+(function(_StatusSchema) {
+	_StatusSchema.StatusRequestBodySchema = /* @__PURE__ */ object({});
+	_StatusSchema.StatusResponseBodySchema = /* @__PURE__ */ object({
+		service: /* @__PURE__ */ literal("bayono-hub"),
+		timestamp: /* @__PURE__ */ pipe(/* @__PURE__ */ string(), /* @__PURE__ */ isoTimestamp()),
+		status: /* @__PURE__ */ literal("ok")
+	});
+})(StatusSchema || (StatusSchema = {}));
+//#endregion
+//#region src/scripts/a-share/inter-app-net/hub-api/summons.ts
+let SummonsSchema;
+(function(_SummonsSchema) {
+	const SummonsAnswerResultSchema = _SummonsSchema.SummonsAnswerResultSchema = /* @__PURE__ */ variant("kind", [_SummonsSchema.SummonsAnswerOkSchema = /* @__PURE__ */ object({
+		kind: /* @__PURE__ */ literal("ok"),
+		payload: /* @__PURE__ */ optional(/* @__PURE__ */ unknown())
+	}), _SummonsSchema.SummonAnswerErrorSchema = /* @__PURE__ */ object({
+		kind: /* @__PURE__ */ literal("error"),
+		code: /* @__PURE__ */ picklist([
+			400,
+			403,
+			404,
+			500
+		]),
+		message: /* @__PURE__ */ string(),
+		details: /* @__PURE__ */ optional(/* @__PURE__ */ string()),
+		payload: /* @__PURE__ */ optional(/* @__PURE__ */ unknown())
+	})]);
+	_SummonsSchema.SummonsAnswerHttpRequestSchema = /* @__PURE__ */ object({ body: _SummonsSchema.SummonsAnswerBodySchema = /* @__PURE__ */ object({
+		summonsId: /* @__PURE__ */ string(),
+		result: SummonsAnswerResultSchema
+	}) });
+	_SummonsSchema.SummonsAnswerHttpResponseSchema = /* @__PURE__ */ object({ body: _SummonsSchema.SummonsAnswerResponseBodySchema = /* @__PURE__ */ object({}) });
+})(SummonsSchema || (SummonsSchema = {}));
+//#endregion
+//#region src/scripts/a-share/inter-app-net/hub-api/web-app-api.ts
+const WebApiSummons = {
+	status: "status",
+	info: "info",
+	pairStart: "pair-start",
+	pairDisconnect: "pair-disconnect"
+};
+let WebAppApiSchema;
+(function(_WebAppApiSchema) {
+	_WebAppApiSchema.WebAppStatusRequestBodySchema = /* @__PURE__ */ object({});
+	_WebAppApiSchema.WebAppStatusResponseBodySchema = /* @__PURE__ */ object({
+		status: /* @__PURE__ */ picklist(["ok", "error"]),
+		message: /* @__PURE__ */ optional(/* @__PURE__ */ string()),
+		timestamp: /* @__PURE__ */ pipe(/* @__PURE__ */ string(), /* @__PURE__ */ isoTimestamp()),
+		uptime: /* @__PURE__ */ string()
+	});
+	_WebAppApiSchema.WebAppInfoRequestBodySchema = /* @__PURE__ */ object({});
+	_WebAppApiSchema.WebAppInfoResponseBodySchema = /* @__PURE__ */ object({
+		version: /* @__PURE__ */ string(),
+		projects: /* @__PURE__ */ array(/* @__PURE__ */ object({
+			name: /* @__PURE__ */ string(),
+			uuid: /* @__PURE__ */ string()
+		})),
+		principal: /* @__PURE__ */ variant("kind", [/* @__PURE__ */ object({ kind: /* @__PURE__ */ literal("anon") }), /* @__PURE__ */ object({
+			kind: /* @__PURE__ */ literal("user"),
+			userId: /* @__PURE__ */ string(),
+			username: /* @__PURE__ */ string()
+		})])
+	});
+	_WebAppApiSchema.WebAppOutlineRequestBodySchema = /* @__PURE__ */ object({});
+	_WebAppApiSchema.WebAppOutlineResponseBodySchema = /* @__PURE__ */ object({ assets: /* @__PURE__ */ array(/* @__PURE__ */ object({
+		name: /* @__PURE__ */ string(),
+		uuid: /* @__PURE__ */ string(),
+		mimeType: /* @__PURE__ */ string()
+	})) });
+	_WebAppApiSchema.WebAppPairStartRequestBodySchema = /* @__PURE__ */ object({
+		projectClientHostId: /* @__PURE__ */ string(),
+		pairRequestId: /* @__PURE__ */ string(),
+		projectUuid: /* @__PURE__ */ optional(/* @__PURE__ */ string()),
+		triggerId: /* @__PURE__ */ optional(/* @__PURE__ */ string())
+	});
+	_WebAppApiSchema.WebAppPairStartResponseBodySchema = /* @__PURE__ */ object({
+		success: /* @__PURE__ */ boolean(),
+		message: /* @__PURE__ */ optional(/* @__PURE__ */ string())
+	});
+	_WebAppApiSchema.WebAppPairDisconnectRequestBodySchema = /* @__PURE__ */ object({ pairSessionId: /* @__PURE__ */ string() });
+	_WebAppApiSchema.WebAppPairDisconnectResponseBodySchema = /* @__PURE__ */ object({
+		success: /* @__PURE__ */ boolean(),
+		message: /* @__PURE__ */ optional(/* @__PURE__ */ string())
+	});
+})(WebAppApiSchema || (WebAppApiSchema = {}));
+//#endregion
+//#region src/scripts/daemon/daemon-info.json
+var version = "1.0.1";
+//#endregion
+//#region src/scripts/daemon/server/client-routes/client-routes.ts
+const clientRoutes = { handleRequest: (args) => {
+	const url = args.req.url ?? "";
+	if (url === Routes.api.client.list) {
+		args.res.sendSuccess({ clients: Array.from(args.hub.clients.clientsByHostId.entries()).map(([clientId, client]) => ({
+			clientId,
+			host: client.host
+		})) });
+		return true;
+	} else {
+		args.logger.log(`No client route found for url: ${url}`);
+		args.res.sendNotFound({ msg: `No client route found` });
+		return false;
+	}
+	return false;
+} };
+//#endregion
+//#region src/scripts/daemon/server/file-request-handler.ts
+const serveRegisteredFile = async (args) => {
+	if (!args.req.url || !args.req.method || args.req.method !== "GET") {
+		args.res.writeHead(400, { "Content-Type": "application/json" });
+		args.res.end(JSON.stringify({ error: "Invalid request; no url or method" }));
+		return true;
+	}
+	let requestUrl;
+	try {
+		requestUrl = new URL(args.req.url, `http://${args.req.headers.host}`);
+	} catch {
+		args.res.writeHead(400, { "Content-Type": "application/json" });
+		args.res.end(JSON.stringify({ error: "Invalid request URL" }));
+		return true;
+	}
+	const regex = /^\/files\/([^/]+)\/(.+)$/;
+	if (!regex.test(requestUrl.pathname)) {
+		args.res.writeHead(400, { "Content-Type": "application/json" });
+		args.res.end(JSON.stringify({ error: "Invalid file request path; does not match expected format" }));
+		return true;
+	}
+	const matched = requestUrl.pathname.match(regex);
+	if (!matched || matched.length < 3) {
+		args.res.writeHead(400, { "Content-Type": "application/json" });
+		args.res.end(JSON.stringify({ error: "Invalid file request path; missing id or relative path" }));
+		return true;
+	}
+	const id = matched[1];
+	const relativePath = matched[2];
+	const normalizedRelativePath = path$1.posix.normalize(relativePath);
+	if (normalizedRelativePath === "." || normalizedRelativePath.startsWith("../") || normalizedRelativePath.includes("/../") || path$1.isAbsolute(normalizedRelativePath)) {
+		args.res.writeHead(400, { "Content-Type": "application/json" });
+		args.res.end(JSON.stringify({ error: "Invalid relative file path" }));
+		return true;
+	}
+	const basePath = args.registeredPaths.get(id);
+	if (!basePath) {
+		args.res.writeHead(404, { "Content-Type": "application/json" });
+		args.res.end(JSON.stringify({ error: "Registered path not found" }));
+		return true;
+	}
+	const resolvedBasePath = path$1.resolve(basePath);
+	const resolvedFilePath = path$1.resolve(resolvedBasePath, normalizedRelativePath);
+	const relativeToBase = path$1.relative(resolvedBasePath, resolvedFilePath);
+	if (relativeToBase.startsWith("..") || path$1.isAbsolute(relativeToBase)) {
+		args.res.writeHead(400, { "Content-Type": "application/json" });
+		args.res.end(JSON.stringify({ error: "Requested file escapes base path" }));
+		return true;
+	}
+	let fileSize = null;
+	try {
+		const fileStats = await stat(resolvedFilePath);
+		if (!fileStats.isFile()) {
+			args.res.writeHead(404, { "Content-Type": "application/json" });
+			args.res.end(JSON.stringify({ error: "File not found: " + resolvedFilePath }));
+			return true;
+		}
+		fileSize = fileStats.size;
+	} catch {
+		args.res.writeHead(500, { "Content-Type": "application/json" });
+		args.res.end(JSON.stringify({ error: "Error retrieving file stats" }));
+		return true;
+	}
+	if (fileSize === null) {
+		args.res.writeHead(500, { "Content-Type": "application/json" });
+		args.res.end(JSON.stringify({ error: "File size could not be determined" }));
+		return true;
+	}
+	try {
+		args.res.writeHead(200, {
+			"Content-Type": "application/octet-stream",
+			"Content-Length": fileSize
+		});
+		const fileStream = createReadStream(resolvedFilePath);
+		fileStream.on("error", () => {
+			if (!args.res.headersSent) args.res.writeHead(500, { "Content-Type": "application/json" });
+			args.res.end(JSON.stringify({ error: "Failed to read file" }));
+		});
+		fileStream.pipe(args.res);
+	} catch (error) {
+		if (!args.res.headersSent) args.res.writeHead(500, { "Content-Type": "application/json" });
+		args.res.end(JSON.stringify({ error: "An unexpected error occurred while serving the file" }));
+	}
+	return true;
+};
+//#endregion
+//#region src/scripts/daemon/server/http-utils.ts
+const httpUtils = {
+	getSubPathParts: (url, prefix) => {
+		return (url.split("?", 1)[0] ?? "").slice(prefix.length).split("/").filter(Boolean);
+	},
+	setupCorsHeaders: (res) => {
+		res.setHeader("Access-Control-Allow-Origin", "*");
+		res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+		res.setHeader("Access-Control-Allow-Headers", "*");
+	},
+	sendJsonResponse: (res, statusCode, data) => {
+		const json = JSON.stringify(data);
+		res.writeHead(statusCode, {
+			"Content-Type": "application/json",
+			"Content-Length": Buffer.byteLength(json)
+		});
+		res.end(json);
+	},
+	readJsonBody: (req) => new Promise((resolve, reject) => {
+		let bodyText = "";
+		req.on("data", (chunk) => {
+			bodyText += chunk.toString();
+		});
+		req.on("end", () => {
+			try {
+				const trimmed = bodyText.trim();
+				resolve(trimmed === "" ? {} : JSON.parse(trimmed));
+			} catch (error) {
+				reject(error);
+			}
+		});
+		req.on("error", reject);
+	})
+};
+var CustomResponse = class {
+	res;
+	constructor(res) {
+		this.res = res;
+	}
+	sendJson(statusCode, data) {
+		httpUtils.sendJsonResponse(this.res, statusCode, data);
+	}
+	sendError(statusCode, data) {
+		this.sendJson(statusCode, {
+			error: data.msg,
+			...data.details ? { details: data.details } : {}
+		});
+	}
+	sendSuccess(data) {
+		this.sendJson(200, data);
+	}
+	sendInternalError(data) {
+		this.sendError(500, data);
+	}
+	sendBadRequest(data) {
+		this.sendError(400, data);
+	}
+	sendNotFound(data) {
+		this.sendError(404, data);
+	}
+};
+//#endregion
+//#region src/scripts/daemon/server/project-client-routes/project-client-routes.ts
+const projectClientRoutes = { handleRequest: async (args) => {
+	const url = args.req.url ?? "";
+	const pathParts = (url.split("?", 1)[0] ?? "").slice(Routes.api.projectClient.pathPrefix.length).split("/").filter(Boolean);
+	const routeAction = pathParts[0] === "id" ? pathParts[2] : pathParts[0];
+	const projectClientHostId = pathParts[0] === "id" ? pathParts[1] : null;
+	if (routeAction === Routes.api.projectClient.info.action) {
+		if (projectClientHostId === null) {
+			args.res.sendBadRequest({ msg: "Missing hostId" });
+			return true;
+		}
+		return handleProjectClientInfo(projectClientHostId, args);
+	}
+	if (routeAction === Routes.api.projectClient.download.action) {
+		if (projectClientHostId === null) {
+			args.res.sendBadRequest({ msg: "Missing hostId" });
+			return true;
+		}
+		args.res.sendJson(501, {
+			error: "Not implemented",
+			route: url
+		});
+		return true;
+	}
+	if (routeAction === Routes.api.projectClient.pairTrigger.action) {
+		if (projectClientHostId === null) {
+			args.res.sendBadRequest({ msg: "Missing hostId" });
+			return true;
+		}
+		return handleProjectClientPairTrigger(projectClientHostId, args);
+	}
+	if (routeAction === Routes.api.projectClient.pairComplete.action) {
+		if (projectClientHostId === null) {
+			args.res.sendBadRequest({ msg: "Missing hostId" });
+			return true;
+		}
+		return handleProjectClientPairComplete(projectClientHostId, args);
+	}
+	if (routeAction === Routes.api.projectClient.pairDisconnect.action) {
+		if (projectClientHostId === null) {
+			args.res.sendBadRequest({ msg: "Missing hostId" });
+			return true;
+		}
+		return handleProjectClientPairDisconnect(projectClientHostId, args);
+	}
+	if (routeAction === Routes.api.projectClient.message.action) {
+		if (projectClientHostId === null) {
+			args.res.sendBadRequest({ msg: "Missing hostId" });
+			return true;
+		}
+		return handleProjectClientMessage(projectClientHostId, args);
+	}
+	if (routeAction === Routes.api.projectClient.askLLm.action) {
+		if (projectClientHostId === null) {
+			args.res.sendBadRequest({ msg: "Missing hostId" });
+			return true;
+		}
+		return handleProjectClientAskLLm(projectClientHostId, args);
+	}
+	args.logger.log(`No project client route found for url: ${url}`);
+	args.res.sendNotFound({ msg: "No project client route found" });
+	return false;
+} };
+async function handleProjectClientInfo(hostId, args) {
+	const rawBody = await httpUtils.readJsonBody(args.req).catch((error) => {
+		args.res.sendBadRequest({
+			msg: "Invalid JSON body",
+			details: error instanceof Error ? error.message : String(error)
+		});
+		return null;
+	});
+	if (rawBody === null) return true;
+	const parsed = /* @__PURE__ */ safeParse(ProjectClientApiSchema.ProjectClientInfoRequestBodySchema, rawBody);
+	if (!parsed.success) {
+		args.res.sendBadRequest({
+			msg: "Invalid request body",
+			details: /* @__PURE__ */ flatten(parsed.issues)
+		});
+		return true;
+	}
+	const requestBody = {
+		...parsed.output,
+		hostId
+	};
+	const client = args.hub.clients.getByHostId(hostId);
+	if (!client || !isProjectClientHost(client.host)) {
+		args.res.sendNotFound({
+			msg: "Project client not found",
+			details: { hostId }
+		});
+		return true;
+	}
+	const summonId = randomUUID();
+	const summonsRequest = {
+		kind: "callMe",
+		action: "init",
+		messageId: randomUUID(),
+		summonId,
+		summonKey: ProjectClientSummons.info,
+		from: args.from?.host ?? void 0,
+		payload: requestBody
+	};
+	const summonsPromise = new SummonsPromise();
+	args.hub.summonsTracker.registry.set(summonId, summonsPromise);
+	client.ws.send(JSON.stringify(summonsRequest));
+	const summonResponse = await summonsPromise.promise;
+	const parsedResponse = /* @__PURE__ */ safeParse(ProjectClientApiSchema.ProjectClientInfoResponseBodySchema, summonResponse);
+	if (!parsedResponse.success) {
+		args.res.sendInternalError({
+			msg: "Invalid response from project client",
+			details: /* @__PURE__ */ flatten(parsedResponse.issues)
+		});
+		return true;
+	}
+	const responseBody = { ...parsedResponse.output };
+	args.res.sendSuccess(responseBody);
+	return true;
+}
+async function handleProjectClientPairTrigger(hostId, args) {
+	if (args.req.method !== "POST") {
+		args.res.sendJson(405, {
+			error: "Method not allowed",
+			route: Routes.api.projectClient.pairTrigger,
+			method: args.req.method ?? "UNKNOWN",
+			allowedMethods: ["POST"]
+		});
+		return true;
+	}
+	const rawBody = await httpUtils.readJsonBody(args.req).catch((error) => {
+		args.res.sendBadRequest({
+			msg: "Invalid JSON body",
+			details: error instanceof Error ? error.message : String(error)
+		});
+		return null;
+	});
+	if (rawBody === null) return true;
+	const parsed = /* @__PURE__ */ safeParse(ProjectClientApiSchema.ProjectClientPairTriggerRequestBodySchema, rawBody);
+	if (!parsed.success) {
+		args.res.sendBadRequest({
+			msg: "Invalid request body",
+			details: /* @__PURE__ */ flatten(parsed.issues)
+		});
+		return true;
+	}
+	const requestBody = {
+		...parsed.output,
+		projectClientHostId: hostId
+	};
+	const client = args.hub.clients.getByHostId(hostId);
+	if (!client || !isProjectClientHost(client.host)) {
+		args.res.sendNotFound({
+			msg: "Project client not found",
+			details: { hostId }
+		});
+		return true;
+	}
+	const summonId = randomUUID();
+	const summonsRequest = {
+		kind: "callMe",
+		action: "init",
+		messageId: randomUUID(),
+		summonId,
+		summonKey: ProjectClientSummons.pairTrigger,
+		from: args.from?.host ?? void 0,
+		payload: requestBody
+	};
+	const summonsPromise = new SummonsPromise();
+	args.hub.summonsTracker.registry.set(summonId, summonsPromise);
+	client.ws.send(JSON.stringify(summonsRequest));
+	const summonResponse = await summonsPromise.promise;
+	const parsedResponse = /* @__PURE__ */ safeParse(ProjectClientApiSchema.ProjectClientPairTriggerResponseBodySchema, summonResponse);
+	if (!parsedResponse.success) {
+		args.res.sendInternalError({
+			msg: "Invalid response from project client",
+			details: /* @__PURE__ */ flatten(parsedResponse.issues)
+		});
+		return true;
+	}
+	const responseBody = { ...parsedResponse.output };
+	args.res.sendSuccess(responseBody);
+	return true;
+}
+async function handleProjectClientPairComplete(hostId, args) {
+	if (args.req.method !== "POST") {
+		args.res.sendJson(405, {
+			error: "Method not allowed",
+			route: Routes.api.projectClient.pairComplete,
+			method: args.req.method ?? "UNKNOWN",
+			allowedMethods: ["POST"]
+		});
+		return true;
+	}
+	const rawBody = await httpUtils.readJsonBody(args.req).catch((error) => {
+		args.res.sendBadRequest({
+			msg: "Invalid JSON body",
+			details: error instanceof Error ? error.message : String(error)
+		});
+		return null;
+	});
+	if (rawBody === null) return true;
+	const parsed = /* @__PURE__ */ safeParse(ProjectClientApiSchema.ProjectClientPairCompleteRequestBodySchema, rawBody);
+	if (!parsed.success) {
+		args.res.sendBadRequest({
+			msg: "Invalid request body",
+			details: /* @__PURE__ */ flatten(parsed.issues)
+		});
+		return true;
+	}
+	const requestBody = {
+		...parsed.output,
+		projectClientHostId: hostId
+	};
+	const client = args.hub.clients.getByHostId(hostId);
+	if (!client || !isProjectClientHost(client.host)) {
+		args.res.sendNotFound({
+			msg: "Project client not found",
+			details: { hostId }
+		});
+		return true;
+	}
+	const summonId = randomUUID();
+	const summonsRequest = {
+		kind: "callMe",
+		action: "init",
+		messageId: randomUUID(),
+		summonId,
+		summonKey: ProjectClientSummons.pairComplete,
+		from: args.from?.host ?? void 0,
+		payload: requestBody
+	};
+	const summonsPromise = new SummonsPromise();
+	args.hub.summonsTracker.registry.set(summonId, summonsPromise);
+	client.ws.send(JSON.stringify(summonsRequest));
+	const summonResponse = await summonsPromise.promise;
+	const parsedResponse = /* @__PURE__ */ safeParse(ProjectClientApiSchema.ProjectClientPairCompleteResponseBodySchema, summonResponse);
+	if (!parsedResponse.success) {
+		args.res.sendInternalError({
+			msg: "Invalid response from project client",
+			details: /* @__PURE__ */ flatten(parsedResponse.issues)
+		});
+		return true;
+	}
+	const responseBody = { ...parsedResponse.output };
+	args.res.sendSuccess(responseBody);
+	return true;
+}
+async function handleProjectClientPairDisconnect(hostId, args) {
+	if (args.req.method !== "POST") {
+		args.res.sendJson(405, {
+			error: "Method not allowed",
+			route: Routes.api.projectClient.pairDisconnect,
+			method: args.req.method ?? "UNKNOWN",
+			allowedMethods: ["POST"]
+		});
+		return true;
+	}
+	const rawBody = await httpUtils.readJsonBody(args.req).catch((error) => {
+		args.res.sendBadRequest({
+			msg: "Invalid JSON body",
+			details: error instanceof Error ? error.message : String(error)
+		});
+		return null;
+	});
+	if (rawBody === null) return true;
+	const parsed = /* @__PURE__ */ safeParse(ProjectClientApiSchema.ProjectClientPairDisconnectRequestBodySchema, rawBody);
+	if (!parsed.success) {
+		args.res.sendBadRequest({
+			msg: "Invalid request body",
+			details: /* @__PURE__ */ flatten(parsed.issues)
+		});
+		return true;
+	}
+	const requestBody = {
+		...parsed.output,
+		projectClientHostId: hostId
+	};
+	const client = args.hub.clients.getByHostId(hostId);
+	if (!client || !isProjectClientHost(client.host)) {
+		args.res.sendNotFound({
+			msg: "Project client not found",
+			details: { hostId }
+		});
+		return true;
+	}
+	const summonId = randomUUID();
+	const summonsRequest = {
+		kind: "callMe",
+		action: "init",
+		messageId: randomUUID(),
+		summonId,
+		summonKey: ProjectClientSummons.pairDisconnect,
+		from: args.from?.host ?? void 0,
+		payload: requestBody
+	};
+	const summonsPromise = new SummonsPromise();
+	args.hub.summonsTracker.registry.set(summonId, summonsPromise);
+	client.ws.send(JSON.stringify(summonsRequest));
+	const summonResponse = await summonsPromise.promise;
+	const parsedResponse = /* @__PURE__ */ safeParse(ProjectClientApiSchema.ProjectClientPairDisconnectResponseBodySchema, summonResponse);
+	if (!parsedResponse.success) {
+		args.res.sendInternalError({
+			msg: "Invalid response from project client",
+			details: /* @__PURE__ */ flatten(parsedResponse.issues)
+		});
+		return true;
+	}
+	const responseBody = { ...parsedResponse.output };
+	args.res.sendSuccess(responseBody);
+	return true;
+}
+async function handleProjectClientMessage(hostId, args) {
+	if (args.req.method !== "POST") {
+		args.res.sendJson(405, {
+			error: "Method not allowed",
+			route: Routes.api.projectClient.message,
+			method: args.req.method ?? "UNKNOWN",
+			allowedMethods: ["POST"]
+		});
+		return true;
+	}
+	const rawBody = await httpUtils.readJsonBody(args.req).catch((error) => {
+		args.res.sendBadRequest({
+			msg: "Invalid JSON body",
+			details: error instanceof Error ? error.message : String(error)
+		});
+		return null;
+	});
+	if (rawBody === null) return true;
+	const parsed = /* @__PURE__ */ safeParse(ProjectClientApiSchema.ProjectClientMessageRequestBodySchema, rawBody);
+	if (!parsed.success) {
+		args.res.sendBadRequest({
+			msg: "Invalid request body",
+			details: /* @__PURE__ */ flatten(parsed.issues)
+		});
+		return true;
+	}
+	const client = args.hub.clients.getByHostId(hostId);
+	if (!client || !isProjectClientHost(client.host)) {
+		args.res.sendNotFound({
+			msg: "Project client not found",
+			details: { hostId }
+		});
+		return true;
+	}
+	const summonId = randomUUID();
+	const summonsRequest = {
+		kind: "callMe",
+		action: "init",
+		messageId: randomUUID(),
+		summonId,
+		summonKey: ProjectClientSummons.message,
+		from: args.from?.host ?? void 0,
+		payload: parsed.output
+	};
+	const summonsPromise = new SummonsPromise();
+	args.hub.summonsTracker.registry.set(summonId, summonsPromise);
+	client.ws.send(JSON.stringify(summonsRequest));
+	const summonResponse = await summonsPromise.promise;
+	const parsedResponse = /* @__PURE__ */ safeParse(ProjectClientApiSchema.ProjectClientMessageResponseBodySchema, summonResponse);
+	if (!parsedResponse.success) {
+		args.res.sendInternalError({
+			msg: "Invalid response from project client",
+			details: /* @__PURE__ */ flatten(parsedResponse.issues)
+		});
+		return true;
+	}
+	const responseBody = { ...parsedResponse.output };
+	args.res.sendSuccess(responseBody);
+	return true;
+}
+async function handleProjectClientAskLLm(hostId, args) {
+	if (args.req.method !== "POST") {
+		args.res.sendJson(405, {
+			error: "Method not allowed",
+			route: Routes.api.projectClient.askLLm,
+			method: args.req.method ?? "UNKNOWN",
+			allowedMethods: ["POST"]
+		});
+		return true;
+	}
+	const rawBody = await httpUtils.readJsonBody(args.req).catch((error) => {
+		args.res.sendBadRequest({
+			msg: "Invalid JSON body",
+			details: error instanceof Error ? error.message : String(error)
+		});
+		return null;
+	});
+	if (rawBody === null) return true;
+	const parsed = /* @__PURE__ */ safeParse(ProjectClientApiSchema.ProjectClientAskLLmRequestBodySchema, rawBody);
+	if (!parsed.success) {
+		args.res.sendBadRequest({
+			msg: "Invalid request body",
+			details: /* @__PURE__ */ flatten(parsed.issues)
+		});
+		return true;
+	}
+	const client = args.hub.clients.getByHostId(hostId);
+	if (!client || !isProjectClientHost(client.host)) {
+		args.res.sendNotFound({
+			msg: "Project client not found",
+			details: { hostId }
+		});
+		return true;
+	}
+	const summonId = randomUUID();
+	const summonsRequest = {
+		kind: "callMe",
+		action: "init",
+		messageId: randomUUID(),
+		summonId,
+		summonKey: ProjectClientSummons.askLLm,
+		from: args.from?.host ?? void 0,
+		payload: parsed.output
+	};
+	const summonsPromise = new SummonsPromise();
+	args.hub.summonsTracker.registry.set(summonId, summonsPromise);
+	client.ws.send(JSON.stringify(summonsRequest));
+	const summonResponse = await summonsPromise.promise;
+	const parsedResponse = /* @__PURE__ */ safeParse(ProjectClientApiSchema.ProjectClientAskLLmResponseBodySchema, summonResponse);
+	if (!parsedResponse.success) {
+		args.res.sendInternalError({
+			msg: "Invalid response from project client",
+			details: /* @__PURE__ */ flatten(parsedResponse.issues)
+		});
+		return true;
+	}
+	const responseBody = { ...parsedResponse.output };
+	args.res.sendSuccess(responseBody);
+	return true;
+}
+function isProjectClientHost(host) {
+	return host?.kind === HostKinds.projectClient;
+}
+//#endregion
+//#region src/scripts/daemon/server/summons-routes/summons-routes.ts
+const summonsRoutes = { handleRequest: async (args) => {
+	const url = args.req.url ?? "";
+	if (url === Routes.api.summons.answer) return handleSummonsAnswer(args);
+	args.logger.log(`No summons route found for url: ${url}`);
+	args.res.sendNotFound({ msg: "No summons route found" });
+	return false;
+} };
+async function handleSummonsAnswer(args) {
+	if (args.req.method !== "POST") {
+		args.res.sendJson(405, {
+			error: "Method not allowed",
+			route: Routes.api.summons.answer,
+			method: args.req.method ?? "UNKNOWN",
+			allowedMethods: ["POST"]
+		});
+		return true;
+	}
+	const rawBody = await httpUtils.readJsonBody(args.req).catch((error) => {
+		args.res.sendBadRequest({
+			msg: "Invalid JSON body",
+			details: error instanceof Error ? error.message : String(error)
+		});
+		return null;
+	});
+	if (rawBody === null) return true;
+	const parsed = /* @__PURE__ */ safeParse(SummonsSchema.SummonsAnswerBodySchema, rawBody);
+	if (!parsed.success) {
+		args.res.sendBadRequest({
+			msg: "Invalid request body",
+			details: /* @__PURE__ */ flatten(parsed.issues)
+		});
+		return true;
+	}
+	const { summonsId, result } = parsed.output;
+	const summonsPromise = args.hub.summonsTracker.registry.get(summonsId);
+	if (!summonsPromise) {
+		args.res.sendNotFound({
+			msg: "Summons not found",
+			details: { summonsId }
+		});
+		return true;
+	}
+	args.hub.summonsTracker.registry.delete(summonsId);
+	if (result.kind === "error") summonsPromise.reject(new Error(result.details ? `${result.message}: ${result.details}` : result.message));
+	else summonsPromise.resolve(result.payload ?? {});
+	args.res.sendSuccess({});
+	return true;
+}
+//#endregion
+//#region src/scripts/daemon/server/web-app-routes/web-app-routes.ts
+const webAppRoutes = { handleRequest: async (args) => {
+	const url = args.req.url ?? "";
+	const pathParts = httpUtils.getSubPathParts(url, Routes.api.webApp.pathPrefix);
+	const routeAction = pathParts[0] === "id" ? pathParts[2] : pathParts[0];
+	const webAppHostId = pathParts[0] === "id" ? pathParts[1] : null;
+	if (routeAction === Routes.api.webApp.pairStart.action) {
+		if (!webAppHostId) {
+			args.res.sendBadRequest({
+				msg: "Missing web app host ID in URL",
+				details: { url }
+			});
+			return true;
+		}
+		return handleWebAppPairStart(webAppHostId, args);
+	}
+	if (routeAction === Routes.api.webApp.pairDisconnect.action) {
+		if (!webAppHostId) {
+			args.res.sendBadRequest({
+				msg: "Missing web app host ID in URL",
+				details: { url }
+			});
+			return true;
+		}
+		return handleWebAppPairDisconnect(webAppHostId, args);
+	}
+	args.logger.log(`No web app route found for url: ${url}`);
+	args.res.sendNotFound({ msg: "No web app route found" });
+	return false;
+} };
+async function handleWebAppPairStart(hostId, args) {
+	if (args.req.method !== "POST") {
+		args.res.sendJson(405, {
+			error: "Method not allowed",
+			route: Routes.api.webApp.pairStart,
+			method: args.req.method ?? "UNKNOWN",
+			allowedMethods: ["POST"]
+		});
+		return true;
+	}
+	const rawBody = await httpUtils.readJsonBody(args.req).catch((error) => {
+		args.res.sendBadRequest({
+			msg: "Invalid JSON body",
+			details: error instanceof Error ? error.message : String(error)
+		});
+		return null;
+	});
+	if (rawBody === null) return true;
+	const parsed = /* @__PURE__ */ safeParse(WebAppApiSchema.WebAppPairStartRequestBodySchema, rawBody);
+	if (!parsed.success) {
+		args.res.sendBadRequest({
+			msg: "Invalid request body",
+			details: /* @__PURE__ */ flatten(parsed.issues)
+		});
+		return true;
+	}
+	const client = args.hub.clients.getByHostId(hostId);
+	if (!client || !isWebAppHost(client.host)) {
+		args.res.sendNotFound({
+			msg: "Web app not found",
+			details: { hostId }
+		});
+		return true;
+	}
+	const summonId = randomUUID();
+	const summonsRequest = {
+		kind: "callMe",
+		action: "init",
+		messageId: randomUUID(),
+		summonId,
+		summonKey: WebApiSummons.pairStart,
+		from: args.from?.host ?? void 0,
+		payload: parsed.output
+	};
+	const summonsPromise = new SummonsPromise();
+	args.hub.summonsTracker.registry.set(summonId, summonsPromise);
+	client.ws.send(JSON.stringify(summonsRequest));
+	const summonResponse = await summonsPromise.promise;
+	const parsedResponse = /* @__PURE__ */ safeParse(WebAppApiSchema.WebAppPairStartResponseBodySchema, summonResponse);
+	if (!parsedResponse.success) {
+		args.res.sendInternalError({
+			msg: "Invalid response from web app",
+			details: /* @__PURE__ */ flatten(parsedResponse.issues)
+		});
+		return true;
+	}
+	const responseBody = { ...parsedResponse.output };
+	args.res.sendSuccess(responseBody);
+	return true;
+}
+async function handleWebAppPairDisconnect(hostId, args) {
+	if (args.req.method !== "POST") {
+		args.res.sendJson(405, {
+			error: "Method not allowed",
+			route: Routes.api.webApp.pairDisconnect,
+			method: args.req.method ?? "UNKNOWN",
+			allowedMethods: ["POST"]
+		});
+		return true;
+	}
+	const rawBody = await httpUtils.readJsonBody(args.req).catch((error) => {
+		args.res.sendBadRequest({
+			msg: "Invalid JSON body",
+			details: error instanceof Error ? error.message : String(error)
+		});
+		return null;
+	});
+	if (rawBody === null) return true;
+	const parsed = /* @__PURE__ */ safeParse(WebAppApiSchema.WebAppPairDisconnectRequestBodySchema, rawBody);
+	if (!parsed.success) {
+		args.res.sendBadRequest({
+			msg: "Invalid request body",
+			details: /* @__PURE__ */ flatten(parsed.issues)
+		});
+		return true;
+	}
+	const client = args.hub.clients.getByHostId(hostId);
+	if (!client || !isWebAppHost(client.host)) {
+		args.res.sendNotFound({
+			msg: "Web app not found",
+			details: { hostId }
+		});
+		return true;
+	}
+	const summonId = randomUUID();
+	const summonsRequest = {
+		kind: "callMe",
+		action: "init",
+		messageId: randomUUID(),
+		summonId,
+		summonKey: WebApiSummons.pairDisconnect,
+		from: args.from?.host ?? void 0,
+		payload: parsed.output
+	};
+	const summonsPromise = new SummonsPromise();
+	args.hub.summonsTracker.registry.set(summonId, summonsPromise);
+	client.ws.send(JSON.stringify(summonsRequest));
+	const summonResponse = await summonsPromise.promise;
+	const parsedResponse = /* @__PURE__ */ safeParse(WebAppApiSchema.WebAppPairDisconnectResponseBodySchema, summonResponse);
+	if (!parsedResponse.success) {
+		args.res.sendInternalError({
+			msg: "Invalid response from web app",
+			details: /* @__PURE__ */ flatten(parsedResponse.issues)
+		});
+		return true;
+	}
+	const responseBody = { ...parsedResponse.output };
+	args.res.sendSuccess(responseBody);
+	return true;
+}
+function isWebAppHost(host) {
+	return host?.kind === HostKinds.webApp;
+}
+//#endregion
+//#region src/scripts/daemon/server/daemon-http-server.ts
+const registeredPaths = /* @__PURE__ */ new Map();
+registeredPaths.set("000", "/home/redwood/Downloads");
+let timeStart = Date.now();
+const logMessage = { onReq: (args) => {
+	const { req, matchedClient } = args;
+	return `HTTP request: ${req.method} ${req.url} from ${req.socket.remoteAddress}:${req.socket.remotePort}, ${matchedClient ? `client: ${matchedClient.host?.id + ", " + matchedClient.host?.kind}` : "unauthenticated"}`;
+} };
+const setupHttpServer = (args) => {
+	return http.createServer((req, httpResponse) => {
+		const res = new CustomResponse(httpResponse);
+		httpUtils.setupCorsHeaders(httpResponse);
+		if (req.method === "OPTIONS") {
+			httpResponse.writeHead(204);
+			httpResponse.end();
+			return;
+		}
+		const iapSecretToken = req.headers["x-iap-auth-from-token"] ?? null;
+		const matchedClient = iapSecretToken && typeof iapSecretToken === "string" ? args.hub.clients.getBySecretToken(iapSecretToken) : null;
+		if (iapSecretToken && !matchedClient) {
+			args.logger.log(`Received request with IAP auth token, but no matching client found. Token: ${iapSecretToken}`);
+			res.sendError(401, { msg: "Unauthorized: Invalid IAP auth token" });
+			return;
+		}
+		args.logger?.log(logMessage.onReq({
+			req,
+			res,
+			matchedClient
+		}));
+		(async () => {
+			if (req.url?.startsWith(DaemonConfig.fileServePath)) {
+				await serveRegisteredFile({
+					hub: args.hub,
+					req,
+					res: httpResponse,
+					registeredPaths
+				});
+				return;
+			}
+			const url = req.url ?? "";
+			if (url === Routes.status || url === "" || url === "/") {
+				res.sendSuccess({
+					service: "bayono-hub",
+					status: "ok",
+					timestamp: (/* @__PURE__ */ new Date()).toISOString()
+				});
+				return true;
+			}
+			if (url === Routes.info) {
+				res.sendSuccess({
+					service: "bayono/hub",
+					status: "ok",
+					timestamp: (/* @__PURE__ */ new Date()).toISOString(),
+					uptime: Date.now() - timeStart,
+					version,
+					appData: {
+						rootDir: args.appData.rootDir,
+						rootKind: args.appData.rootKind
+					}
+				});
+				return true;
+			}
+			if (url.startsWith(Routes.api.client.pathPrefix)) {
+				clientRoutes.handleRequest({
+					req,
+					res,
+					hub: args.hub,
+					appData: args.appData,
+					timeStartMs: timeStart,
+					logger: args.logger,
+					from: matchedClient
+				});
+				return;
+			}
+			if (url.startsWith(Routes.api.projectClient.pathPrefix)) {
+				await projectClientRoutes.handleRequest({
+					req,
+					res,
+					hub: args.hub,
+					appData: args.appData,
+					timeStartMs: timeStart,
+					logger: args.logger,
+					from: matchedClient
+				});
+				return;
+			}
+			if (url.startsWith(Routes.api.webApp.pathPrefix)) {
+				await webAppRoutes.handleRequest({
+					req,
+					res,
+					hub: args.hub,
+					appData: args.appData,
+					timeStartMs: timeStart,
+					logger: args.logger,
+					from: matchedClient
+				});
+				return;
+			}
+			if (url.startsWith(Routes.api.summons.pathPrefix)) {
+				await summonsRoutes.handleRequest({
+					req,
+					res,
+					hub: args.hub,
+					appData: args.appData,
+					timeStartMs: timeStart,
+					logger: args.logger,
+					from: matchedClient
+				});
+				return;
+			}
+			res.sendError(404, { msg: "Not found" });
+		})().catch((error) => {
+			args.logger.log(`HTTP server request failed: ${error instanceof Error ? error.message : String(error)}`);
+			res.sendInternalError({ msg: "Internal server error" });
+		});
+	});
+};
 //#endregion
 //#region node_modules/ws/lib/constants.js
 var require_constants = /* @__PURE__ */ __commonJSMin(((exports, module) => {
@@ -2751,7 +5038,7 @@ var require_websocket = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 	const tls = __require("tls");
 	const { randomBytes, createHash: createHash$1 } = __require("crypto");
 	const { Duplex: Duplex$2, Readable } = __require("stream");
-	const { URL } = __require("url");
+	const { URL: URL$1 } = __require("url");
 	const PerMessageDeflate = require_permessage_deflate();
 	const Receiver = require_receiver();
 	const Sender = require_sender();
@@ -3280,9 +5567,9 @@ var require_websocket = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 		websocket._closeTimeout = opts.closeTimeout;
 		if (!protocolVersions.includes(opts.protocolVersion)) throw new RangeError(`Unsupported protocol version: ${opts.protocolVersion} (supported versions: ${protocolVersions.join(", ")})`);
 		let parsedUrl;
-		if (address instanceof URL) parsedUrl = address;
+		if (address instanceof URL$1) parsedUrl = address;
 		else try {
-			parsedUrl = new URL(address);
+			parsedUrl = new URL$1(address);
 		} catch {
 			throw new SyntaxError(`Invalid URL: ${address}`);
 		}
@@ -3388,7 +5675,7 @@ var require_websocket = /* @__PURE__ */ __commonJSMin(((exports, module) => {
 				req.abort();
 				let addr;
 				try {
-					addr = new URL(location, address);
+					addr = new URL$1(location, address);
 				} catch (e) {
 					emitErrorAndClose(websocket, /* @__PURE__ */ new SyntaxError(`Invalid URL: ${location}`));
 					return;
@@ -4258,7 +6545,7 @@ require_subprotocol();
 require_websocket();
 var import_websocket_server = /* @__PURE__ */ __toESM(require_websocket_server(), 1);
 //#endregion
-//#region src/scripts/daemon/daemon-web-server.ts
+//#region src/scripts/daemon/server/daemon-ws-server.ts
 const setupWsServer = (args) => {
 	const wss = new import_websocket_server.default({
 		server: args.httpServer,
@@ -4272,6 +6559,7 @@ const setupWsServer = (args) => {
 		ws.on("close", () => {
 			args.logger.log("WebSocket client disconnected");
 		});
+		args.onConnection?.(ws);
 	});
 	wss.on("error", (error) => {
 		console.error("WebSocket server error:", error);
@@ -4279,20 +6567,6 @@ const setupWsServer = (args) => {
 	});
 	console.log(`WebSocket server listening on ${DaemonConfig.wsPath} path`);
 	return wss;
-};
-const setupHttpServer = (args) => {
-	return http.createServer((req, res) => {
-		if (req.url === DaemonConfig.statusPath) {
-			res.writeHead(200, { "Content-Type": "application/json" });
-			res.end(JSON.stringify({
-				status: "ok",
-				timestamp: (/* @__PURE__ */ new Date()).toISOString()
-			}));
-		} else {
-			res.writeHead(404, { "Content-Type": "application/json" });
-			res.end(JSON.stringify({ error: "Not found" }));
-		}
-	});
 };
 //#endregion
 //#region src/scripts/daemon/daemon-server.ts
@@ -4302,13 +6576,16 @@ var DaemonServer = class {
 	status = { running: false };
 	httpServer = null;
 	wsServer = null;
+	core;
 	constructor(appData, logger) {
 		this.appData = appData;
 		this.logger = logger;
 		logger.log(`DaemonServer initialized with app data folder: ${appData.rootDir}`);
+		this.core = new DaemonHub(this.logger);
 	}
 	start() {
 		const httpServer = setupHttpServer({
+			hub: this.core,
 			appData: this.appData,
 			logger: this.logger
 		});
@@ -4316,14 +6593,19 @@ var DaemonServer = class {
 		this.wsServer = setupWsServer({
 			httpServer,
 			parent: this,
-			logger: this.logger
+			logger: this.logger,
+			onConnection: (ws) => {
+				this.core.handleConnection(ws);
+			}
 		});
-		httpServer.listen(AppConstants.mainServerPort, () => {
+		this.core.websocketServer = this.wsServer;
+		httpServer.listen(AppConstants.mainServerPort, "127.0.0.1", () => {
 			this.status.running = true;
 			this.logger.log("Started Web Server");
 			{
 				const message = formatters.highlighted(`== HTTP SERVER STARTED ==`) + `
-\n  PORT: ${AppConstants.mainServerPort}`;
+
+  HOST: 127.0.0.1\n  PORT: ${AppConstants.mainServerPort}`;
 				console.log(message);
 			}
 		});
@@ -4357,7 +6639,7 @@ var DaemonServer = class {
 	}
 };
 //#endregion
-//#region src/scripts/daemon/daemon-server-utils.ts
+//#region src/scripts/daemon/server/daemon-server-utils.ts
 const DaemonServerUtils = { make: async () => {
 	if (await DaemonDevClientUtils.isUp()) throw new Error("Daemon is already running");
 	const appData = await AppDataUtils.getGlobalAppData();
